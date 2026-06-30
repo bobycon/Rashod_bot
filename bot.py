@@ -42,6 +42,18 @@ def get_conn():
     )
 
 
+DEFAULT_CATEGORIES = [
+    "🍔 Еда",
+    "🚌 Транспорт",
+    "🏠 ЖКХ",
+    "🎉 Развлечения",
+    "👕 Одежда",
+    "💊 Здоровье",
+    "📱 Связь/интернет",
+    "🛒 Прочее",
+]
+
+
 # ---------- База данных ----------
 
 def init_db():
@@ -66,6 +78,17 @@ def init_db():
                 category TEXT NOT NULL,
                 limit_amount DOUBLE PRECISION NOT NULL,
                 PRIMARY KEY (user_id, category)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS categories (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                name TEXT NOT NULL,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (user_id, name)
             )
             """
         )
@@ -189,13 +212,106 @@ def get_all_limits(user_id: int):
         conn.close()
 
 
-def delete_limit(user_id: int, category: str):
+# ---------- Категории (хранятся в базе, свои у каждого пользователя) ----------
+
+def ensure_default_categories(user_id: int):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM categories WHERE user_id = %s", (user_id,))
+        count = cur.fetchone()[0]
+        if count == 0:
+            for i, name in enumerate(DEFAULT_CATEGORIES):
+                cur.execute(
+                    "INSERT INTO categories (user_id, name, sort_order) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (user_id, name) DO NOTHING",
+                    (user_id, name, i),
+                )
+            conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
+def get_user_categories(user_id: int):
+    ensure_default_categories(user_id)
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute(
+            "SELECT name FROM categories WHERE user_id = %s ORDER BY sort_order, name",
+            (user_id,),
+        )
+        rows = [r[0] for r in cur.fetchall()]
+        cur.close()
+        return rows
+    finally:
+        conn.close()
+
+
+def add_category(user_id: int, name: str) -> bool:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COALESCE(MAX(sort_order), -1) FROM categories WHERE user_id = %s", (user_id,))
+        max_order = cur.fetchone()[0]
+        try:
+            cur.execute(
+                "INSERT INTO categories (user_id, name, sort_order) VALUES (%s, %s, %s)",
+                (user_id, name, max_order + 1),
+            )
+            conn.commit()
+            ok = True
+        except Exception:
+            conn.rollback()
+            ok = False
+        cur.close()
+        return ok
+    finally:
+        conn.close()
+
+
+def rename_category(user_id: int, old_name: str, new_name: str) -> bool:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "UPDATE categories SET name = %s WHERE user_id = %s AND name = %s",
+                (new_name, user_id, old_name),
+            )
+            # Обновляем категорию и в уже существующих расходах/лимитах для согласованности
+            cur.execute(
+                "UPDATE expenses SET category = %s WHERE user_id = %s AND category = %s",
+                (new_name, user_id, old_name),
+            )
+            cur.execute(
+                "UPDATE limits SET category = %s WHERE user_id = %s AND category = %s "
+                "AND NOT EXISTS (SELECT 1 FROM limits WHERE user_id = %s AND category = %s)",
+                (new_name, user_id, old_name, user_id, new_name),
+            )
+            conn.commit()
+            ok = True
+        except Exception:
+            conn.rollback()
+            ok = False
+        cur.close()
+        return ok
+    finally:
+        conn.close()
+
+
+def delete_category(user_id: int, name: str):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM categories WHERE user_id = %s AND name = %s",
+            (user_id, name),
+        )
+        cur.execute(
             "DELETE FROM limits WHERE user_id = %s AND category = %s",
-            (user_id, category),
+            (user_id, name),
         )
         conn.commit()
         cur.close()
@@ -203,38 +319,28 @@ def delete_limit(user_id: int, category: str):
         conn.close()
 
 
-# ---------- Категории ----------
+# ---------- Состояния диалогов ----------
 
-CATEGORIES = [
-    "🍔 Еда",
-    "🚌 Транспорт",
-    "🏠 ЖКХ",
-    "🎉 Развлечения",
-    "👕 Одежда",
-    "💊 Здоровье",
-    "📱 Связь/интернет",
-    "🛒 Прочее",
-]
-
-# Состояния диалогов
 WAITING_AMOUNT, WAITING_CATEGORY, WAITING_CUSTOM_CATEGORY = range(3)
 LIMIT_WAITING_CATEGORY, LIMIT_WAITING_AMOUNT = range(3, 5)
+CATMGR_WAITING_NEW_NAME, CATMGR_WAITING_RENAME = range(5, 7)
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["➕ Добавить расход"],
         ["📊 За сегодня", "📅 За месяц"],
-        ["🎯 Лимиты", "❌ Удалить последнюю"],
-        ["ℹ️ Помощь"],
+        ["🎯 Лимиты", "⚙️ Категории"],
+        ["❌ Удалить последнюю", "ℹ️ Помощь"],
     ],
     resize_keyboard=True,
 )
 
 
-def categories_inline_keyboard(prefix="cat"):
+def categories_inline_keyboard(user_id: int, prefix="cat"):
+    cats = get_user_categories(user_id)
     buttons = []
     row = []
-    for i, cat in enumerate(CATEGORIES, 1):
+    for i, cat in enumerate(cats, 1):
         row.append(InlineKeyboardButton(cat, callback_data=f"{prefix}:{cat}"))
         if i % 2 == 0:
             buttons.append(row)
@@ -242,7 +348,7 @@ def categories_inline_keyboard(prefix="cat"):
     if row:
         buttons.append(row)
     if prefix == "cat":
-        buttons.append([InlineKeyboardButton("✏️ Своя категория", callback_data="cat:custom")])
+        buttons.append([InlineKeyboardButton("✏️ Своя категория (разово)", callback_data="cat:custom")])
     buttons.append([InlineKeyboardButton("🚫 Отмена", callback_data=f"{prefix}:cancel")])
     return InlineKeyboardMarkup(buttons)
 
@@ -254,6 +360,20 @@ def limits_menu_keyboard():
             [InlineKeyboardButton("🚫 Закрыть", callback_data="limitmenu:close")],
         ]
     )
+
+
+def categories_manage_keyboard(user_id: int):
+    cats = get_user_categories(user_id)
+    buttons = []
+    for cat in cats:
+        buttons.append([
+            InlineKeyboardButton(cat, callback_data="catnoop"),
+            InlineKeyboardButton("✏️", callback_data=f"catedit:{cat}"),
+            InlineKeyboardButton("🗑", callback_data=f"catdel:{cat}"),
+        ])
+    buttons.append([InlineKeyboardButton("➕ Добавить категорию", callback_data="catadd:new")])
+    buttons.append([InlineKeyboardButton("🚫 Закрыть", callback_data="catmgr:close")])
+    return InlineKeyboardMarkup(buttons)
 
 
 # ---------- Проверка лимита после добавления расхода ----------
@@ -280,10 +400,12 @@ async def check_and_warn_limit(user_id: int, category: str, send_func):
 # ---------- Базовые команды ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_default_categories(update.effective_user.id)
     await update.message.reply_text(
         "Привет! Я помогу вести учёт расходов.\n\n"
         "➕ Добавить расход — записать трату по шагам\n"
         "🎯 Лимиты — установить лимит по категории и следить за ним\n"
+        "⚙️ Категории — добавить, переименовать или удалить категории\n"
         "📊 За сегодня / 📅 За месяц — посмотреть статистику\n"
         "/add 500 еда — быстрое добавление одной строкой\n",
         reply_markup=MAIN_KEYBOARD,
@@ -344,7 +466,7 @@ async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["pending_amount"] = amount
     await update.message.reply_text(
         f"Сумма: {amount:.2f}\nТеперь выбери категорию:",
-        reply_markup=categories_inline_keyboard("cat"),
+        reply_markup=categories_inline_keyboard(update.effective_user.id, "cat"),
     )
     return WAITING_CATEGORY
 
@@ -360,7 +482,7 @@ async def category_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if choice == "custom":
-        await query.edit_message_text("Напиши название своей категории текстом:")
+        await query.edit_message_text("Напиши название категории текстом (разово, не сохранится в списке):")
         return WAITING_CUSTOM_CATEGORY
 
     amount = context.user_data.pop("pending_amount", None)
@@ -398,6 +520,7 @@ async def custom_category_received(update: Update, context: ContextTypes.DEFAULT
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("pending_amount", None)
     context.user_data.pop("pending_limit_category", None)
+    context.user_data.pop("pending_rename_category", None)
     await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
     return ConversationHandler.END
 
@@ -434,7 +557,7 @@ async def limits_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if action == "set":
         await query.edit_message_text(
             "Выбери категорию, для которой хочешь задать месячный лимит:",
-            reply_markup=categories_inline_keyboard("limitcat"),
+            reply_markup=categories_inline_keyboard(query.from_user.id, "limitcat"),
         )
         return LIMIT_WAITING_CATEGORY
 
@@ -477,6 +600,95 @@ async def limit_amount_received(update: Update, context: ContextTypes.DEFAULT_TY
         f"Лимит установлен: {category} — {amount:.2f} в месяц.",
         reply_markup=MAIN_KEYBOARD,
     )
+    return ConversationHandler.END
+
+
+# ---------- Управление категориями ----------
+
+async def categories_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await update.message.reply_text(
+        "Твои категории:\n✏️ — переименовать, 🗑 — удалить",
+        reply_markup=categories_manage_keyboard(user_id),
+    )
+
+
+async def categories_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "catmgr:close":
+        await query.edit_message_text("Закрыто.")
+        return ConversationHandler.END
+
+    if data == "catnoop":
+        return None
+
+    if data == "catadd:new":
+        await query.edit_message_text("Введи название новой категории (можно с эмодзи):")
+        return CATMGR_WAITING_NEW_NAME
+
+    if data.startswith("catedit:"):
+        old_name = data.split(":", 1)[1]
+        context.user_data["pending_rename_category"] = old_name
+        await query.edit_message_text(f"Введи новое название для категории «{old_name}»:")
+        return CATMGR_WAITING_RENAME
+
+    if data.startswith("catdel:"):
+        name = data.split(":", 1)[1]
+        delete_category(query.from_user.id, name)
+        await query.edit_message_text(
+            f"Категория «{name}» удалена. Уже добавленные расходы в этой категории остаются в истории.",
+            reply_markup=categories_manage_keyboard(query.from_user.id),
+        )
+        return ConversationHandler.END
+
+    return ConversationHandler.END
+
+
+async def category_new_name_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("Название не может быть пустым, попробуй ещё раз:")
+        return CATMGR_WAITING_NEW_NAME
+
+    user_id = update.effective_user.id
+    ok = add_category(user_id, name)
+    if ok:
+        await update.message.reply_text(
+            f"Категория «{name}» добавлена.",
+            reply_markup=categories_manage_keyboard(user_id),
+        )
+    else:
+        await update.message.reply_text(
+            f"Такая категория уже есть. Попробуй другое название:",
+        )
+        return CATMGR_WAITING_NEW_NAME
+    return ConversationHandler.END
+
+
+async def category_rename_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_name = update.message.text.strip()
+    old_name = context.user_data.pop("pending_rename_category", None)
+    if not old_name or not new_name:
+        await update.message.reply_text("Что-то пошло не так, начни заново через ⚙️ Категории.")
+        return ConversationHandler.END
+
+    user_id = update.effective_user.id
+    ok = rename_category(user_id, old_name, new_name)
+    if ok:
+        await update.message.reply_text(
+            f"Категория «{old_name}» переименована в «{new_name}». "
+            f"История расходов и лимит по этой категории сохранены.",
+            reply_markup=categories_manage_keyboard(user_id),
+        )
+    else:
+        await update.message.reply_text(
+            "Не получилось переименовать (возможно, такое название уже есть). Попробуй другое:"
+        )
+        context.user_data["pending_rename_category"] = old_name
+        return CATMGR_WAITING_RENAME
     return ConversationHandler.END
 
 
@@ -532,6 +744,8 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await help_cmd(update, context)
     elif text == "🎯 Лимиты":
         await limits_open(update, context)
+    elif text == "⚙️ Категории":
+        await categories_open(update, context)
 
 
 def main():
@@ -573,14 +787,35 @@ def main():
         per_message=False,
     )
 
+    category_manage_conversation = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(
+                categories_manage_callback,
+                pattern=r"^(catmgr:|catadd:|catedit:|catdel:|catnoop)",
+            ),
+        ],
+        states={
+            CATMGR_WAITING_NEW_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, category_new_name_received)
+            ],
+            CATMGR_WAITING_RENAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, category_rename_received)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+        per_message=False,
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(add_conversation)
     app.add_handler(limit_conversation)
+    app.add_handler(category_manage_conversation)
     app.add_handler(CommandHandler("today", today))
     app.add_handler(CommandHandler("month", month))
     app.add_handler(CommandHandler("undo", undo))
     app.add_handler(CommandHandler("limits", limits_open))
+    app.add_handler(CommandHandler("categories", categories_open))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
 
     print("Бот запущен...")
