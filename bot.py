@@ -8,7 +8,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from telegram.ext import JobQueue
 
 from telegram import (
     Update,
@@ -26,14 +25,14 @@ from telegram.ext import (
     filters,
 )
 
+# ──────────────────────────────────────────────
+# КОНФИГУРАЦИЯ
+# ──────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВАШ_ТОКЕН_ЗДЕСЬ")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 if not DATABASE_URL:
-    raise RuntimeError(
-        "Переменная окружения DATABASE_URL не найдена. "
-        "Подключи PostgreSQL в Railway и добавь ссылку на DATABASE_URL в Variables бота."
-    )
+    raise RuntimeError("DATABASE_URL не задан. Добавь переменную в Railway Variables.")
 
 _parsed = urlparse(DATABASE_URL)
 
@@ -48,498 +47,398 @@ def get_conn():
     )
 
 
+# ──────────────────────────────────────────────
+# БАЗА ДАННЫХ
+# ──────────────────────────────────────────────
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS expenses (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            amount DOUBLE PRECISION NOT NULL,
+            category TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS incomes (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            amount DOUBLE PRECISION NOT NULL,
+            source TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS limits (
+            user_id BIGINT NOT NULL,
+            category TEXT NOT NULL,
+            limit_amount DOUBLE PRECISION NOT NULL,
+            PRIMARY KEY (user_id, category)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS categories (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            name TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            UNIQUE (user_id, name)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS recurring (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            name TEXT NOT NULL,
+            amount DOUBLE PRECISION NOT NULL,
+            category TEXT NOT NULL,
+            day_of_month INTEGER NOT NULL,
+            last_added DATE
+        )
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+# ── Расходы ──
+def add_expense(user_id, amount, category):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO expenses (user_id, amount, category, created_at) VALUES (%s,%s,%s,%s)",
+        (user_id, amount, category, datetime.now()),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def delete_last_expense(user_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM expenses WHERE user_id=%s ORDER BY id DESC LIMIT 1", (user_id,))
+    row = cur.fetchone()
+    if row:
+        cur.execute("DELETE FROM expenses WHERE id=%s", (row[0],))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return row is not None
+
+
+def get_expenses(user_id, since):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT amount, category, created_at FROM expenses "
+        "WHERE user_id=%s AND created_at>=%s ORDER BY created_at DESC",
+        (user_id, since),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+
+def get_expenses_by_day(user_id, since, until):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT DATE(created_at), SUM(amount) FROM expenses "
+        "WHERE user_id=%s AND created_at>=%s AND created_at<%s "
+        "GROUP BY DATE(created_at) ORDER BY DATE(created_at)",
+        (user_id, since, until),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+
+def get_expenses_by_category(user_id, since):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT category, SUM(amount) FROM expenses "
+        "WHERE user_id=%s AND created_at>=%s "
+        "GROUP BY category ORDER BY SUM(amount) DESC",
+        (user_id, since),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+
+def get_month_spent(user_id, category):
+    since = datetime.combine(date.today().replace(day=1), datetime.min.time())
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COALESCE(SUM(amount),0) FROM expenses "
+        "WHERE user_id=%s AND category=%s AND created_at>=%s",
+        (user_id, category, since),
+    )
+    total = float(cur.fetchone()[0])
+    cur.close()
+    conn.close()
+    return total
+
+
+# ── Доходы ──
+def add_income(user_id, amount, source):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO incomes (user_id, amount, source, created_at) VALUES (%s,%s,%s,%s)",
+        (user_id, amount, source, datetime.now()),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def get_incomes(user_id, since):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT amount, source FROM incomes WHERE user_id=%s AND created_at>=%s",
+        (user_id, since),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+
+def get_balance(user_id, since):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COALESCE(SUM(amount),0) FROM incomes WHERE user_id=%s AND created_at>=%s",
+        (user_id, since),
+    )
+    total_in = float(cur.fetchone()[0])
+    cur.execute(
+        "SELECT COALESCE(SUM(amount),0) FROM expenses WHERE user_id=%s AND created_at>=%s",
+        (user_id, since),
+    )
+    total_ex = float(cur.fetchone()[0])
+    cur.close()
+    conn.close()
+    return total_in, total_ex
+
+
+# ── Лимиты ──
+def set_limit(user_id, category, amount):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO limits (user_id, category, limit_amount) VALUES (%s,%s,%s) "
+        "ON CONFLICT (user_id, category) DO UPDATE SET limit_amount=EXCLUDED.limit_amount",
+        (user_id, category, amount),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def get_limit(user_id, category):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT limit_amount FROM limits WHERE user_id=%s AND category=%s",
+        (user_id, category),
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return float(row[0]) if row else None
+
+
+def get_all_limits(user_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT category, limit_amount FROM limits WHERE user_id=%s ORDER BY category",
+        (user_id,),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+
+# ── Категории ──
 DEFAULT_CATEGORIES = [
-    "🍔 Еда",
-    "🚌 Транспорт",
-    "🏠 ЖКХ",
-    "🎉 Развлечения",
-    "👕 Одежда",
-    "💊 Здоровье",
-    "📱 Связь/интернет",
-    "🛒 Прочее",
+    "🍔 Еда", "🚌 Транспорт", "🏠 ЖКХ", "🎉 Развлечения",
+    "👕 Одежда", "💊 Здоровье", "📱 Связь/интернет", "🛒 Прочее",
 ]
 
 
-# ---------- База данных ----------
-
-def init_db():
+def ensure_default_categories(user_id):
     conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS expenses (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                amount DOUBLE PRECISION NOT NULL,
-                category TEXT NOT NULL,
-                created_at TIMESTAMP NOT NULL
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM categories WHERE user_id=%s", (user_id,))
+    if cur.fetchone()[0] == 0:
+        for i, name in enumerate(DEFAULT_CATEGORIES):
+            cur.execute(
+                "INSERT INTO categories (user_id, name, sort_order) VALUES (%s,%s,%s) "
+                "ON CONFLICT (user_id, name) DO NOTHING",
+                (user_id, name, i),
             )
-            """
-        )
+        conn.commit()
+    cur.close()
+    conn.close()
+
+
+def get_user_categories(user_id):
+    ensure_default_categories(user_id)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT name FROM categories WHERE user_id=%s ORDER BY sort_order, name",
+        (user_id,),
+    )
+    rows = [r[0] for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return rows
+
+
+def add_category(user_id, name):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COALESCE(MAX(sort_order),-1) FROM categories WHERE user_id=%s", (user_id,))
+    max_order = cur.fetchone()[0]
+    try:
         cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS limits (
-                user_id BIGINT NOT NULL,
-                category TEXT NOT NULL,
-                limit_amount DOUBLE PRECISION NOT NULL,
-                PRIMARY KEY (user_id, category)
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS categories (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                name TEXT NOT NULL,
-                sort_order INTEGER NOT NULL DEFAULT 0,
-                UNIQUE (user_id, name)
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS incomes (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                amount DOUBLE PRECISION NOT NULL,
-                source TEXT NOT NULL,
-                created_at TIMESTAMP NOT NULL
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS recurring (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                name TEXT NOT NULL,
-                amount DOUBLE PRECISION NOT NULL,
-                category TEXT NOT NULL,
-                day_of_month INTEGER NOT NULL,
-                last_added DATE
-            )
-            """
+            "INSERT INTO categories (user_id, name, sort_order) VALUES (%s,%s,%s)",
+            (user_id, name, max_order + 1),
         )
         conn.commit()
-        cur.close()
-    finally:
-        conn.close()
+        ok = True
+    except Exception:
+        conn.rollback()
+        ok = False
+    cur.close()
+    conn.close()
+    return ok
 
 
-def add_expense(user_id: int, amount: float, category: str):
+def rename_category(user_id, old_name, new_name):
     conn = get_conn()
+    cur = conn.cursor()
     try:
-        cur = conn.cursor()
         cur.execute(
-            "INSERT INTO expenses (user_id, amount, category, created_at) VALUES (%s, %s, %s, %s)",
-            (user_id, amount, category, datetime.now()),
+            "UPDATE categories SET name=%s WHERE user_id=%s AND name=%s",
+            (new_name, user_id, old_name),
+        )
+        cur.execute(
+            "UPDATE expenses SET category=%s WHERE user_id=%s AND category=%s",
+            (new_name, user_id, old_name),
+        )
+        cur.execute(
+            "UPDATE limits SET category=%s WHERE user_id=%s AND category=%s "
+            "AND NOT EXISTS (SELECT 1 FROM limits WHERE user_id=%s AND category=%s)",
+            (new_name, user_id, old_name, user_id, new_name),
         )
         conn.commit()
-        cur.close()
-    finally:
-        conn.close()
+        ok = True
+    except Exception:
+        conn.rollback()
+        ok = False
+    cur.close()
+    conn.close()
+    return ok
 
 
-def delete_last_expense(user_id: int):
+def delete_category(user_id, name):
     conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id FROM expenses WHERE user_id = %s ORDER BY id DESC LIMIT 1",
-            (user_id,),
-        )
-        row = cur.fetchone()
-        if row:
-            cur.execute("DELETE FROM expenses WHERE id = %s", (row[0],))
-        conn.commit()
-        cur.close()
-        return row is not None
-    finally:
-        conn.close()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM categories WHERE user_id=%s AND name=%s", (user_id, name))
+    cur.execute("DELETE FROM limits WHERE user_id=%s AND category=%s", (user_id, name))
+    conn.commit()
+    cur.close()
+    conn.close()
 
 
-def get_expenses(user_id: int, since):
+# ── Регулярные платежи ──
+def add_recurring(user_id, name, amount, category, day_of_month):
     conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT amount, category, created_at FROM expenses "
-            "WHERE user_id = %s AND created_at >= %s ORDER BY created_at DESC",
-            (user_id, since),
-        )
-        rows = cur.fetchall()
-        cur.close()
-        return rows
-    finally:
-        conn.close()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO recurring (user_id, name, amount, category, day_of_month, last_added) "
+        "VALUES (%s,%s,%s,%s,%s,NULL)",
+        (user_id, name, amount, category, day_of_month),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
 
 
-def get_expenses_by_day(user_id: int, since, until):
+def get_recurring(user_id):
     conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT DATE(created_at), SUM(amount) FROM expenses "
-            "WHERE user_id = %s AND created_at >= %s AND created_at < %s "
-            "GROUP BY DATE(created_at) ORDER BY DATE(created_at)",
-            (user_id, since, until),
-        )
-        rows = cur.fetchall()
-        cur.close()
-        return rows
-    finally:
-        conn.close()
-
-
-def get_expenses_by_category(user_id: int, since):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT category, SUM(amount) FROM expenses "
-            "WHERE user_id = %s AND created_at >= %s "
-            "GROUP BY category ORDER BY SUM(amount) DESC",
-            (user_id, since),
-        )
-        rows = cur.fetchall()
-        cur.close()
-        return rows
-    finally:
-        conn.close()
-
-
-def add_income(user_id: int, amount: float, source: str):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO incomes (user_id, amount, source, created_at) VALUES (%s, %s, %s, %s)",
-            (user_id, amount, source, datetime.now()),
-        )
-        conn.commit()
-        cur.close()
-    finally:
-        conn.close()
-
-
-def delete_last_income(user_id: int):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id FROM incomes WHERE user_id = %s ORDER BY id DESC LIMIT 1",
-            (user_id,),
-        )
-        row = cur.fetchone()
-        if row:
-            cur.execute("DELETE FROM incomes WHERE id = %s", (row[0],))
-        conn.commit()
-        cur.close()
-        return row is not None
-    finally:
-        conn.close()
-
-
-def get_incomes(user_id: int, since):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT amount, source, created_at FROM incomes "
-            "WHERE user_id = %s AND created_at >= %s ORDER BY created_at DESC",
-            (user_id, since),
-        )
-        rows = cur.fetchall()
-        cur.close()
-        return rows
-    finally:
-        conn.close()
-
-
-def get_balance(user_id: int, since):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT COALESCE(SUM(amount), 0) FROM incomes WHERE user_id = %s AND created_at >= %s",
-            (user_id, since),
-        )
-        total_income = float(cur.fetchone()[0])
-        cur.execute(
-            "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE user_id = %s AND created_at >= %s",
-            (user_id, since),
-        )
-        total_expense = float(cur.fetchone()[0])
-        cur.close()
-        return total_income, total_expense
-    finally:
-        conn.close()
-
-
-    since = datetime.combine(date.today().replace(day=1), datetime.min.time())
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT COALESCE(SUM(amount), 0) FROM expenses "
-            "WHERE user_id = %s AND category = %s AND created_at >= %s",
-            (user_id, category, since),
-        )
-        total = cur.fetchone()[0]
-        cur.close()
-        return float(total)
-    finally:
-        conn.close()
-
-
-# ---------- Шаблоны регулярных трат ----------
-
-def add_recurring(user_id: int, name: str, amount: float, category: str, day_of_month: int):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO recurring (user_id, name, amount, category, day_of_month, last_added) "
-            "VALUES (%s, %s, %s, %s, %s, NULL)",
-            (user_id, name, amount, category, day_of_month),
-        )
-        conn.commit()
-        cur.close()
-    finally:
-        conn.close()
-
-
-def get_recurring(user_id: int):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id, name, amount, category, day_of_month, last_added "
-            "FROM recurring WHERE user_id = %s ORDER BY day_of_month, name",
-            (user_id,),
-        )
-        rows = cur.fetchall()
-        cur.close()
-        return rows
-    finally:
-        conn.close()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, name, amount, category, day_of_month, last_added "
+        "FROM recurring WHERE user_id=%s ORDER BY day_of_month, name",
+        (user_id,),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
 
 
 def get_all_recurring():
-    """Все шаблоны всех пользователей — для планировщика."""
     conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id, user_id, name, amount, category, day_of_month, last_added FROM recurring"
-        )
-        rows = cur.fetchall()
-        cur.close()
-        return rows
-    finally:
-        conn.close()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, user_id, name, amount, category, day_of_month, last_added FROM recurring"
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
 
 
-def delete_recurring(rec_id: int, user_id: int):
+def delete_recurring(rec_id, user_id):
     conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "DELETE FROM recurring WHERE id = %s AND user_id = %s",
-            (rec_id, user_id),
-        )
-        conn.commit()
-        cur.close()
-    finally:
-        conn.close()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM recurring WHERE id=%s AND user_id=%s", (rec_id, user_id))
+    conn.commit()
+    cur.close()
+    conn.close()
 
 
-def mark_recurring_added(rec_id: int, added_date: date):
+def mark_recurring_added(rec_id, added_date):
     conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE recurring SET last_added = %s WHERE id = %s",
-            (added_date, rec_id),
-        )
-        conn.commit()
-        cur.close()
-    finally:
-        conn.close()
+    cur = conn.cursor()
+    cur.execute("UPDATE recurring SET last_added=%s WHERE id=%s", (added_date, rec_id))
+    conn.commit()
+    cur.close()
+    conn.close()
 
 
-def set_limit(user_id: int, category: str, amount: float):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO limits (user_id, category, limit_amount)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (user_id, category)
-            DO UPDATE SET limit_amount = EXCLUDED.limit_amount
-            """,
-            (user_id, category, amount),
-        )
-        conn.commit()
-        cur.close()
-    finally:
-        conn.close()
+# ──────────────────────────────────────────────
+# СОСТОЯНИЯ ДИАЛОГОВ
+# ──────────────────────────────────────────────
+(
+    EXP_AMOUNT, EXP_CATEGORY, EXP_CUSTOM_CAT,
+    INC_AMOUNT, INC_SOURCE, INC_CUSTOM_SRC,
+    LIM_CATEGORY, LIM_AMOUNT,
+    CAT_NEW_NAME, CAT_RENAME,
+    REC_NAME, REC_AMOUNT, REC_CATEGORY, REC_DAY,
+) = range(14)
 
-
-def get_limit(user_id: int, category: str):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT limit_amount FROM limits WHERE user_id = %s AND category = %s",
-            (user_id, category),
-        )
-        row = cur.fetchone()
-        cur.close()
-        return float(row[0]) if row else None
-    finally:
-        conn.close()
-
-
-def get_all_limits(user_id: int):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT category, limit_amount FROM limits WHERE user_id = %s ORDER BY category",
-            (user_id,),
-        )
-        rows = cur.fetchall()
-        cur.close()
-        return rows
-    finally:
-        conn.close()
-
-
-# ---------- Категории (хранятся в базе, свои у каждого пользователя) ----------
-
-def ensure_default_categories(user_id: int):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM categories WHERE user_id = %s", (user_id,))
-        count = cur.fetchone()[0]
-        if count == 0:
-            for i, name in enumerate(DEFAULT_CATEGORIES):
-                cur.execute(
-                    "INSERT INTO categories (user_id, name, sort_order) VALUES (%s, %s, %s) "
-                    "ON CONFLICT (user_id, name) DO NOTHING",
-                    (user_id, name, i),
-                )
-            conn.commit()
-        cur.close()
-    finally:
-        conn.close()
-
-
-def get_user_categories(user_id: int):
-    ensure_default_categories(user_id)
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT name FROM categories WHERE user_id = %s ORDER BY sort_order, name",
-            (user_id,),
-        )
-        rows = [r[0] for r in cur.fetchall()]
-        cur.close()
-        return rows
-    finally:
-        conn.close()
-
-
-def add_category(user_id: int, name: str) -> bool:
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT COALESCE(MAX(sort_order), -1) FROM categories WHERE user_id = %s", (user_id,))
-        max_order = cur.fetchone()[0]
-        try:
-            cur.execute(
-                "INSERT INTO categories (user_id, name, sort_order) VALUES (%s, %s, %s)",
-                (user_id, name, max_order + 1),
-            )
-            conn.commit()
-            ok = True
-        except Exception:
-            conn.rollback()
-            ok = False
-        cur.close()
-        return ok
-    finally:
-        conn.close()
-
-
-def rename_category(user_id: int, old_name: str, new_name: str) -> bool:
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        try:
-            cur.execute(
-                "UPDATE categories SET name = %s WHERE user_id = %s AND name = %s",
-                (new_name, user_id, old_name),
-            )
-            # Обновляем категорию и в уже существующих расходах/лимитах для согласованности
-            cur.execute(
-                "UPDATE expenses SET category = %s WHERE user_id = %s AND category = %s",
-                (new_name, user_id, old_name),
-            )
-            cur.execute(
-                "UPDATE limits SET category = %s WHERE user_id = %s AND category = %s "
-                "AND NOT EXISTS (SELECT 1 FROM limits WHERE user_id = %s AND category = %s)",
-                (new_name, user_id, old_name, user_id, new_name),
-            )
-            conn.commit()
-            ok = True
-        except Exception:
-            conn.rollback()
-            ok = False
-        cur.close()
-        return ok
-    finally:
-        conn.close()
-
-
-def delete_category(user_id: int, name: str):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "DELETE FROM categories WHERE user_id = %s AND name = %s",
-            (user_id, name),
-        )
-        cur.execute(
-            "DELETE FROM limits WHERE user_id = %s AND category = %s",
-            (user_id, name),
-        )
-        conn.commit()
-        cur.close()
-    finally:
-        conn.close()
-
-
-# ---------- Состояния диалогов ----------
-
-WAITING_AMOUNT, WAITING_CATEGORY, WAITING_CUSTOM_CATEGORY = range(3)
-LIMIT_WAITING_CATEGORY, LIMIT_WAITING_AMOUNT = range(3, 5)
-CATMGR_WAITING_NEW_NAME, CATMGR_WAITING_RENAME = range(5, 7)
-INCOME_WAITING_AMOUNT, INCOME_WAITING_SOURCE = range(7, 9)
-REC_WAITING_NAME, REC_WAITING_AMOUNT, REC_WAITING_CATEGORY, REC_WAITING_DAY = range(9, 13)
-
-MENU_BUTTONS_PATTERN = (
-    "^(➕ Добавить расход|💵 Добавить доход|📊 За сегодня|📅 За месяц|"
-    "💰 Баланс|📈 Графики|🎯 Лимиты|⚙️ Категории|"
-    "🔄 Регулярные платежи|❌ Удалить последнюю|ℹ️ Помощь)$"
-)
-
+# ──────────────────────────────────────────────
+# КЛАВИАТУРЫ
+# ──────────────────────────────────────────────
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["➕ Добавить расход", "💵 Добавить доход"],
@@ -552,58 +451,259 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-
 INCOME_SOURCES = [
-    "💼 Зарплата",
-    "🎁 Подарок",
-    "📈 Инвестиции",
-    "🏠 Аренда",
-    "💻 Фриланс",
-    "🏦 Кешбэк/проценты",
-    "🛍 Продажа",
-    "💰 Прочее",
+    "💼 Зарплата", "🎁 Подарок", "📈 Инвестиции", "🏠 Аренда",
+    "💻 Фриланс", "🏦 Кешбэк/проценты", "🛍 Продажа", "💰 Прочее",
+]
+
+CHART_COLORS = [
+    "#FF6B6B", "#4ECDC4", "#45B7D1", "#96CEB4", "#FFEAA7",
+    "#DDA0DD", "#98D8C8", "#F7DC6F", "#BB8FCE", "#85C1E9",
 ]
 
 
-def income_sources_keyboard():
-    buttons = []
-    row = []
-    for i, src in enumerate(INCOME_SOURCES, 1):
-        row.append(InlineKeyboardButton(src, callback_data=f"inc:{src}"))
+def make_kb(items, prefix, extra_buttons=None, cancel=True):
+    """Универсальный конструктор inline-клавиатуры."""
+    buttons, row = [], []
+    for i, item in enumerate(items, 1):
+        row.append(InlineKeyboardButton(item, callback_data=f"{prefix}:{item}"))
         if i % 2 == 0:
             buttons.append(row)
             row = []
     if row:
         buttons.append(row)
-    buttons.append([InlineKeyboardButton("✏️ Свой источник", callback_data="inc:custom")])
-    buttons.append([InlineKeyboardButton("🚫 Отмена", callback_data="inc:cancel")])
-    return InlineKeyboardMarkup(buttons)
-    cats = get_user_categories(user_id)
-    buttons = []
-    row = []
-    for i, cat in enumerate(cats, 1):
-        row.append(InlineKeyboardButton(cat, callback_data=f"{prefix}:{cat}"))
-        if i % 2 == 0:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    if prefix == "cat":
-        buttons.append([InlineKeyboardButton("✏️ Своя категория (разово)", callback_data="cat:custom")])
-    buttons.append([InlineKeyboardButton("🚫 Отмена", callback_data=f"{prefix}:cancel")])
+    if extra_buttons:
+        for btn in extra_buttons:
+            buttons.append([btn])
+    if cancel:
+        buttons.append([InlineKeyboardButton("🚫 Отмена", callback_data=f"{prefix}:__cancel__")])
     return InlineKeyboardMarkup(buttons)
 
 
-def limits_menu_keyboard():
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("➕ Установить / изменить лимит", callback_data="limitmenu:set")],
-            [InlineKeyboardButton("🚫 Закрыть", callback_data="limitmenu:close")],
-        ]
+# ──────────────────────────────────────────────
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ──────────────────────────────────────────────
+async def warn_limit(user_id, category, reply_func):
+    limit = get_limit(user_id, category)
+    if not limit:
+        return
+    spent = get_month_spent(user_id, category)
+    ratio = spent / limit
+    if spent > limit:
+        await reply_func(f"⚠️ Превышен лимит «{category}»! {spent:.2f} из {limit:.2f}")
+    elif ratio >= 0.8:
+        await reply_func(f"🔔 {spent:.2f} из {limit:.2f} по «{category}» ({ratio*100:.0f}%)")
+
+
+def fmt_summary(rows, title):
+    if not rows:
+        return f"{title}: записей пока нет."
+    total = sum(r[0] for r in rows)
+    by_cat = {}
+    for amt, cat, *_ in rows:
+        by_cat[cat] = by_cat.get(cat, 0) + amt
+    lines = [title, f"Всего: {total:.2f}", ""]
+    for cat, amt in sorted(by_cat.items(), key=lambda x: -x[1]):
+        lines.append(f"• {cat}: {amt:.2f}")
+    return "\n".join(lines)
+
+
+def make_pie(rows, title):
+    labels = [r[0] for r in rows]
+    values = [float(r[1]) for r in rows]
+    fig, ax = plt.subplots(figsize=(7, 5), facecolor="#1e1e2e")
+    ax.set_facecolor("#1e1e2e")
+    wedges, _, autotexts = ax.pie(
+        values, labels=None, autopct=lambda p: f"{p:.1f}%" if p > 3 else "",
+        colors=CHART_COLORS[:len(values)], startangle=140,
+        wedgeprops={"edgecolor": "#1e1e2e", "linewidth": 1.5}, pctdistance=0.75,
+    )
+    for at in autotexts:
+        at.set_color("white")
+        at.set_fontsize(9)
+    patches = [mpatches.Patch(color=CHART_COLORS[i % len(CHART_COLORS)],
+               label=f"{labels[i]}  —  {values[i]:.0f}") for i in range(len(labels))]
+    ax.legend(handles=patches, loc="center left", bbox_to_anchor=(1, 0.5),
+              fontsize=9, facecolor="#2e2e3e", labelcolor="white", edgecolor="#555")
+    ax.set_title(f"{title}\nВсего: {sum(values):.0f}", color="white", fontsize=12, pad=15)
+    buf = io.BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format="png", dpi=130, bbox_inches="tight", facecolor="#1e1e2e")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def make_bar(rows, title):
+    if not rows:
+        return None
+    days = [str(r[0]) for r in rows]
+    values = [float(r[1]) for r in rows]
+    labels = [f"{d.split('-')[2]}.{d.split('-')[1]}" for d in days]
+    fig, ax = plt.subplots(figsize=(max(7, len(days) * 0.5 + 2), 4.5), facecolor="#1e1e2e")
+    ax.set_facecolor("#2e2e3e")
+    bars = ax.bar(range(len(values)), values, color="#4ECDC4", edgecolor="#1e1e2e", linewidth=0.8)
+    for bar, val in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(values) * 0.01,
+                f"{val:.0f}", ha="center", va="bottom", color="white", fontsize=8)
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=45, ha="right", color="white", fontsize=8)
+    ax.tick_params(axis="y", colors="white")
+    ax.spines[:].set_color("#555")
+    ax.set_title(title, color="white", fontsize=12, pad=10)
+    ax.set_ylabel("Сумма", color="white", fontsize=9)
+    buf = io.BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format="png", dpi=130, bbox_inches="tight", facecolor="#1e1e2e")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+# ──────────────────────────────────────────────
+# КОМАНДЫ БЕЗ ДИАЛОГА
+# ──────────────────────────────────────────────
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_default_categories(update.effective_user.id)
+    await update.message.reply_text(
+        "Привет! Я бюджетный трекер.\n\n"
+        "➕ Добавить расход / 💵 Добавить доход — записать трату или доход\n"
+        "💰 Баланс — остаток за месяц\n"
+        "📈 Графики — диаграммы расходов\n"
+        "🎯 Лимиты — лимиты по категориям\n"
+        "⚙️ Категории — управление категориями\n"
+        "🔄 Регулярные платежи — автоматические ежемесячные траты\n"
+        "/add 500 еда — быстрое добавление расхода\n"
+        "/income 50000 зарплата — быстрое добавление дохода\n",
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
-def categories_manage_keyboard(user_id: int):
+async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    since = datetime.combine(date.today(), datetime.min.time())
+    rows = get_expenses(update.effective_user.id, since)
+    await update.message.reply_text(fmt_summary(rows, "Расходы за сегодня"))
+
+
+async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    since = datetime.combine(date.today().replace(day=1), datetime.min.time())
+    rows = get_expenses(update.effective_user.id, since)
+    await update.message.reply_text(fmt_summary(rows, "Расходы за месяц"))
+
+
+async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ok = delete_last_expense(update.effective_user.id)
+    await update.message.reply_text(
+        "Последняя запись удалена." if ok else "Записей пока нет."
+    )
+
+
+async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    since = datetime.combine(date.today().replace(day=1), datetime.min.time())
+    inc_total, exp_total = get_balance(user_id, since)
+    inc_rows = get_incomes(user_id, since)
+    by_src = {}
+    for amt, src in inc_rows:
+        by_src[src] = by_src.get(src, 0) + amt
+    month_name = date.today().strftime("%B %Y")
+    lines = [f"💰 Баланс за {month_name}", ""]
+    lines.append("📥 Доходы:")
+    if by_src:
+        for src, amt in sorted(by_src.items(), key=lambda x: -x[1]):
+            lines.append(f"  • {src}: +{amt:.2f}")
+        lines.append(f"  Итого: {inc_total:.2f}")
+    else:
+        lines.append("  Доходов пока нет")
+    lines.append(f"\n📤 Расходы: {exp_total:.2f}")
+    remaining = inc_total - exp_total
+    if inc_total == 0:
+        lines.append(f"\n💳 Остаток: {remaining:.2f}")
+        lines.append("(Добавь доходы через 💵 Добавить доход)")
+    elif remaining >= 0:
+        lines.append(f"\n✅ Остаток: {remaining:.2f}")
+    else:
+        lines.append(f"\n🔴 Перерасход: {remaining:.2f}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_charts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Выбери тип графика:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🥧 По категориям (месяц)", callback_data="chart:pie_month")],
+            [InlineKeyboardButton("📊 По дням (месяц)", callback_data="chart:bar_month")],
+            [InlineKeyboardButton("📊 По дням (7 дней)", callback_data="chart:bar_week")],
+            [InlineKeyboardButton("🚫 Закрыть", callback_data="chart:close")],
+        ]),
+    )
+
+
+async def cb_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+
+    if action == "close":
+        await query.edit_message_text("Закрыто.")
+        return
+
+    await query.edit_message_text("⏳ Строю график...")
+
+    if action == "pie_month":
+        since = datetime.combine(date.today().replace(day=1), datetime.min.time())
+        rows = get_expenses_by_category(user_id, since)
+        if not rows:
+            await context.bot.send_message(chat_id=chat_id, text="За этот месяц расходов нет.")
+            return
+        buf = make_pie(rows, f"Расходы по категориям\n{date.today().strftime('%B %Y')}")
+        await context.bot.send_photo(chat_id=chat_id, photo=buf)
+
+    elif action == "bar_month":
+        since = datetime.combine(date.today().replace(day=1), datetime.min.time())
+        rows = get_expenses_by_day(user_id, since, datetime.now())
+        if not rows:
+            await context.bot.send_message(chat_id=chat_id, text="За этот месяц расходов нет.")
+            return
+        buf = make_bar(rows, f"Траты по дням — {date.today().strftime('%B %Y')}")
+        await context.bot.send_photo(chat_id=chat_id, photo=buf)
+
+    elif action == "bar_week":
+        since = datetime.combine(date.today() - timedelta(days=6), datetime.min.time())
+        rows = get_expenses_by_day(user_id, since, datetime.now())
+        if not rows:
+            await context.bot.send_message(chat_id=chat_id, text="За 7 дней расходов нет.")
+            return
+        buf = make_bar(rows, "Траты за последние 7 дней")
+        await context.bot.send_photo(chat_id=chat_id, photo=buf)
+
+
+async def cmd_limits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    rows = get_all_limits(user_id)
+    if not rows:
+        text = "Лимиты пока не установлены."
+    else:
+        lines = ["Лимиты на этот месяц:\n"]
+        for cat, lim in rows:
+            spent = get_month_spent(user_id, cat)
+            ratio = spent / lim if lim > 0 else 0
+            mark = "🔴" if spent > lim else ("🟡" if ratio >= 0.8 else "🟢")
+            lines.append(f"{mark} {cat}: {spent:.2f} / {lim:.2f}")
+        text = "\n".join(lines)
+    await update.message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Установить лимит", callback_data="limitmenu:set")],
+            [InlineKeyboardButton("🚫 Закрыть", callback_data="limitmenu:close")],
+        ]),
+    )
+
+
+async def cmd_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     cats = get_user_categories(user_id)
     buttons = []
     for cat in cats:
@@ -614,645 +714,13 @@ def categories_manage_keyboard(user_id: int):
         ])
     buttons.append([InlineKeyboardButton("➕ Добавить категорию", callback_data="catadd:new")])
     buttons.append([InlineKeyboardButton("🚫 Закрыть", callback_data="catmgr:close")])
-    return InlineKeyboardMarkup(buttons)
-
-
-# ---------- Проверка лимита после добавления расхода ----------
-
-async def check_and_warn_limit(user_id: int, category: str, send_func):
-    limit = get_limit(user_id, category)
-    if limit is None:
-        return
-    spent = get_month_spent_for_category(user_id, category)
-    ratio = spent / limit if limit > 0 else 0
-
-    if spent > limit:
-        await send_func(
-            f"⚠️ Превышен лимит по категории «{category}»!\n"
-            f"Потрачено в этом месяце: {spent:.2f} из {limit:.2f}"
-        )
-    elif ratio >= 0.8:
-        await send_func(
-            f"🔔 Внимание: потрачено {spent:.2f} из {limit:.2f} по категории «{category}» "
-            f"({ratio*100:.0f}% лимита за месяц)"
-        )
-
-
-COLORS = [
-    "#FF6B6B", "#4ECDC4", "#45B7D1", "#96CEB4", "#FFEAA7",
-    "#DDA0DD", "#98D8C8", "#F7DC6F", "#BB8FCE", "#85C1E9",
-]
-
-
-def make_pie_chart(rows, title):
-    labels = [r[0] for r in rows]
-    values = [float(r[1]) for r in rows]
-    total = sum(values)
-
-    fig, ax = plt.subplots(figsize=(7, 5), facecolor="#1e1e2e")
-    ax.set_facecolor("#1e1e2e")
-
-    wedges, texts, autotexts = ax.pie(
-        values,
-        labels=None,
-        autopct=lambda p: f"{p:.1f}%" if p > 3 else "",
-        colors=COLORS[:len(values)],
-        startangle=140,
-        wedgeprops={"edgecolor": "#1e1e2e", "linewidth": 1.5},
-        pctdistance=0.75,
-    )
-    for at in autotexts:
-        at.set_color("white")
-        at.set_fontsize(9)
-
-    legend_labels = [f"{l}  —  {v:.0f}" for l, v in zip(labels, values)]
-    patches = [mpatches.Patch(color=COLORS[i % len(COLORS)], label=legend_labels[i])
-               for i in range(len(labels))]
-    ax.legend(handles=patches, loc="center left", bbox_to_anchor=(1, 0.5),
-              fontsize=9, facecolor="#2e2e3e", labelcolor="white", edgecolor="#555")
-
-    ax.set_title(f"{title}\nВсего: {total:.0f}", color="white", fontsize=12, pad=15)
-
-    buf = io.BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format="png", dpi=130, bbox_inches="tight", facecolor="#1e1e2e")
-    plt.close(fig)
-    buf.seek(0)
-    return buf
-
-
-def make_bar_chart(rows, title):
-    if not rows:
-        return None
-
-    days = [str(r[0]) for r in rows]
-    values = [float(r[1]) for r in rows]
-
-    # Короткие метки: день.месяц
-    short_labels = []
-    for d in days:
-        parts = d.split("-")
-        short_labels.append(f"{parts[2]}.{parts[1]}")
-
-    fig, ax = plt.subplots(figsize=(max(7, len(days) * 0.5 + 2), 4.5), facecolor="#1e1e2e")
-    ax.set_facecolor("#2e2e3e")
-
-    bars = ax.bar(range(len(values)), values, color="#4ECDC4", edgecolor="#1e1e2e", linewidth=0.8)
-
-    for bar, val in zip(bars, values):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(values) * 0.01,
-                f"{val:.0f}", ha="center", va="bottom", color="white", fontsize=8)
-
-    ax.set_xticks(range(len(short_labels)))
-    ax.set_xticklabels(short_labels, rotation=45, ha="right", color="white", fontsize=8)
-    ax.tick_params(axis="y", colors="white")
-    ax.spines[:].set_color("#555")
-    ax.set_title(title, color="white", fontsize=12, pad=10)
-    ax.set_ylabel("Сумма", color="white", fontsize=9)
-    ax.yaxis.label.set_color("white")
-
-    buf = io.BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format="png", dpi=130, bbox_inches="tight", facecolor="#1e1e2e")
-    plt.close(fig)
-    buf.seek(0)
-    return buf
-
-
-def charts_menu_keyboard():
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🥧 Расходы по категориям (месяц)", callback_data="chart:pie_month")],
-            [InlineKeyboardButton("📊 Траты по дням (месяц)", callback_data="chart:bar_month")],
-            [InlineKeyboardButton("📊 Траты по дням (7 дней)", callback_data="chart:bar_week")],
-            [InlineKeyboardButton("🚫 Закрыть", callback_data="chart:close")],
-        ]
-    )
-
-
-async def charts_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Выбери тип графика:",
-        reply_markup=charts_menu_keyboard(),
-    )
-
-
-async def chart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    action = query.data.split(":", 1)[1]
-    user_id = query.from_user.id
-    chat_id = query.message.chat_id
-
-    if action == "close":
-        await query.edit_message_text("Закрыто.")
-        return
-
-    await query.edit_message_text("⏳ Строю график, подожди секунду...")
-
-    if action == "pie_month":
-        since = datetime.combine(date.today().replace(day=1), datetime.min.time())
-        rows = get_expenses_by_category(user_id, since)
-        if not rows:
-            await context.bot.send_message(chat_id=chat_id, text="За этот месяц расходов пока нет.")
-            return
-        month_name = date.today().strftime("%B %Y")
-        buf = make_pie_chart(rows, f"Расходы по категориям\n{month_name}")
-        await context.bot.send_photo(chat_id=chat_id, photo=buf)
-
-    elif action == "bar_month":
-        since = datetime.combine(date.today().replace(day=1), datetime.min.time())
-        until = datetime.now()
-        rows = get_expenses_by_day(user_id, since, until)
-        if not rows:
-            await context.bot.send_message(chat_id=chat_id, text="За этот месяц расходов пока нет.")
-            return
-        month_name = date.today().strftime("%B %Y")
-        buf = make_bar_chart(rows, f"Траты по дням — {month_name}")
-        await context.bot.send_photo(chat_id=chat_id, photo=buf)
-
-    elif action == "bar_week":
-        since = datetime.combine(date.today() - timedelta(days=6), datetime.min.time())
-        until = datetime.now()
-        rows = get_expenses_by_day(user_id, since, until)
-        if not rows:
-            await context.bot.send_message(chat_id=chat_id, text="За последние 7 дней расходов пока нет.")
-            return
-        buf = make_bar_chart(rows, "Траты за последние 7 дней")
-        await context.bot.send_photo(chat_id=chat_id, photo=buf)
-
-
-# ---------- Базовые команды ----------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ensure_default_categories(update.effective_user.id)
-    await update.message.reply_text(
-        "Привет! Я помогу вести учёт расходов.\n\n"
-        "🔄 Регулярные платежи — шаблоны, которые добавляются сами каждый месяц\n"
-        "➕ Добавить расход — записать трату по шагам\n"
-        "💵 Добавить доход — записать доход по шагам или /income 50000 зарплата\n"
-        "💰 Баланс — доходы, расходы и остаток за месяц\n"
-        "📈 Графики — круговая диаграмма и график по дням\n"
-        "🎯 Лимиты — установить лимит по категории и следить за ним\n"
-        "⚙️ Категории — добавить, переименовать или удалить категории\n"
-        "📊 За сегодня / 📅 За месяц — посмотреть статистику\n"
-        "/add 500 еда — быстрое добавление одной строкой\n",
-        reply_markup=MAIN_KEYBOARD,
-    )
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start(update, context)
-
-
-# ---------- Пошаговое добавление расхода ----------
-
-async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Введи сумму расхода (например: 350 или 199.50):"
-    )
-    return WAITING_AMOUNT
-
-
-async def add_quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        return await add_start(update, context)
-
-    if len(args) < 2:
-        await update.message.reply_text(
-            "Формат: /add <сумма> <категория>, например /add 350 кафе\n"
-            "Либо просто отправь /add без аргументов для пошагового ввода."
-        )
-        return ConversationHandler.END
-
-    try:
-        amount = float(args[0].replace(",", "."))
-    except ValueError:
-        await update.message.reply_text("Сумма должна быть числом. Например: /add 350 кафе")
-        return ConversationHandler.END
-
-    category = " ".join(args[1:])
-    user_id = update.effective_user.id
-    add_expense(user_id, amount, category)
-    await update.message.reply_text(f"Добавлено: {amount:.2f} — {category}")
-    await check_and_warn_limit(user_id, category, update.message.reply_text)
-    return ConversationHandler.END
-
-
-async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().replace(",", ".")
-    try:
-        amount = float(text)
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text(
-            "Не похоже на сумму. Введи число, например: 350"
-        )
-        return WAITING_AMOUNT
-
-    context.user_data["pending_amount"] = amount
-    await update.message.reply_text(
-        f"Сумма: {amount:.2f}\nТеперь выбери категорию:",
-        reply_markup=categories_inline_keyboard(update.effective_user.id, "cat"),
-    )
-    return WAITING_CATEGORY
-
-
-async def category_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    choice = query.data.split(":", 1)[1]
-
-    if choice == "cancel":
-        context.user_data.pop("pending_amount", None)
-        await query.edit_message_text("Добавление отменено.")
-        return ConversationHandler.END
-
-    if choice == "custom":
-        await query.edit_message_text("Напиши название категории текстом (разово, не сохранится в списке):")
-        return WAITING_CUSTOM_CATEGORY
-
-    amount = context.user_data.pop("pending_amount", None)
-    if amount is None:
-        await query.edit_message_text("Что-то пошло не так, начни заново через ➕ Добавить расход.")
-        return ConversationHandler.END
-
-    user_id = query.from_user.id
-    add_expense(user_id, amount, choice)
-    await query.edit_message_text(f"Добавлено: {amount:.2f} — {choice}")
-
-    chat_id = query.message.chat_id
-
-    async def send_warning(txt):
-        await context.bot.send_message(chat_id=chat_id, text=txt)
-
-    await check_and_warn_limit(user_id, choice, send_warning)
-    return ConversationHandler.END
-
-
-async def custom_category_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    category = update.message.text.strip()
-    amount = context.user_data.pop("pending_amount", None)
-    if amount is None or not category:
-        await update.message.reply_text("Что-то пошло не так, начни заново через ➕ Добавить расход.")
-        return ConversationHandler.END
-
-    user_id = update.effective_user.id
-    add_expense(user_id, amount, category)
-    await update.message.reply_text(f"Добавлено: {amount:.2f} — {category}")
-    await check_and_warn_limit(user_id, category, update.message.reply_text)
-    return ConversationHandler.END
-
-
-async def income_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Введи сумму дохода (например: 50000 или 1500.50):"
-    )
-    return INCOME_WAITING_AMOUNT
-
-
-async def income_quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        return await income_start(update, context)
-    if len(args) < 2:
-        await update.message.reply_text(
-            "Формат: /income <сумма> <источник>, например /income 50000 зарплата\n"
-            "Либо просто /income без аргументов для пошагового ввода."
-        )
-        return ConversationHandler.END
-    try:
-        amount = float(args[0].replace(",", "."))
-    except ValueError:
-        await update.message.reply_text("Сумма должна быть числом, например: /income 50000 зарплата")
-        return ConversationHandler.END
-    source = " ".join(args[1:])
-    add_income(update.effective_user.id, amount, source)
-    await update.message.reply_text(f"Доход записан: +{amount:.2f} — {source}")
-    return ConversationHandler.END
-
-
-async def income_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().replace(",", ".")
-    try:
-        amount = float(text)
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("Нужно ввести положительное число, например: 50000")
-        return INCOME_WAITING_AMOUNT
-    context.user_data["pending_income"] = amount
-    await update.message.reply_text(
-        f"Сумма: {amount:.2f}\nВыбери источник дохода:",
-        reply_markup=income_sources_keyboard(),
-    )
-    return INCOME_WAITING_SOURCE
-
-
-async def income_source_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    choice = query.data.split(":", 1)[1]
-
-    if choice == "cancel":
-        context.user_data.pop("pending_income", None)
-        await query.edit_message_text("Добавление дохода отменено.")
-        return ConversationHandler.END
-
-    if choice == "custom":
-        await query.edit_message_text("Введи название источника дохода текстом:")
-        return INCOME_WAITING_SOURCE
-
-    amount = context.user_data.pop("pending_income", None)
-    if amount is None:
-        await query.edit_message_text("Что-то пошло не так, начни заново через 💵 Добавить доход.")
-        return ConversationHandler.END
-
-    add_income(query.from_user.id, amount, choice)
-    await query.edit_message_text(f"Доход записан: +{amount:.2f} — {choice}")
-    return ConversationHandler.END
-
-
-async def income_custom_source_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    source = update.message.text.strip()
-    amount = context.user_data.pop("pending_income", None)
-    if not source or amount is None:
-        await update.message.reply_text("Что-то пошло не так, начни заново через 💵 Добавить доход.")
-        return ConversationHandler.END
-    add_income(update.effective_user.id, amount, source)
-    await update.message.reply_text(f"Доход записан: +{amount:.2f} — {source}")
-    return ConversationHandler.END
-
-
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    since = datetime.combine(date.today().replace(day=1), datetime.min.time())
-    income_total, expense_total = get_balance(user_id, since)
-    remaining = income_total - expense_total
-
-    # Доходы по источникам
-    income_rows = get_incomes(user_id, since)
-    by_source = {}
-    for amt, src, _ in income_rows:
-        by_source[src] = by_source.get(src, 0) + amt
-
-    month_name = date.today().strftime("%B %Y")
-    lines = [f"💰 Баланс за {month_name}", ""]
-
-    lines.append("📥 Доходы:")
-    if by_source:
-        for src, amt in sorted(by_source.items(), key=lambda x: -x[1]):
-            lines.append(f"  • {src}: +{amt:.2f}")
-        lines.append(f"  Итого доходов: {income_total:.2f}")
-    else:
-        lines.append("  Доходов пока нет")
-
-    lines.append("")
-    lines.append(f"📤 Расходы: {expense_total:.2f}")
-    lines.append("")
-
-    if income_total == 0:
-        lines.append(f"💳 Остаток: {remaining:.2f}")
-        lines.append("(Добавь доходы через 💵 Добавить доход)")
-    elif remaining >= 0:
-        lines.append(f"✅ Остаток: {remaining:.2f}")
-    else:
-        lines.append(f"🔴 Перерасход: {remaining:.2f}")
-
-    await update.message.reply_text("\n".join(lines))
-
-
-async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("pending_amount", None)
-    context.user_data.pop("pending_limit_category", None)
-    context.user_data.pop("pending_rename_category", None)
-    context.user_data.pop("pending_income", None)
-    context.user_data.pop("rec_name", None)
-    context.user_data.pop("rec_amount", None)
-    context.user_data.pop("rec_category", None)
-    await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
-    return ConversationHandler.END
-
-
-async def menu_button_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Перехватывает нажатия кнопок главного меню внутри любого диалога."""
-    context.user_data.clear()
-    await cancel_conversation(update, context)
-    # После сброса — выполняем нужное действие
-    await handle_buttons(update, context)
-    return ConversationHandler.END
-
-
-# ---------- Лимиты ----------
-
-async def limits_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    rows = get_all_limits(user_id)
-
-    if not rows:
-        text = "Лимиты пока не установлены."
-    else:
-        lines = ["Текущие лимиты на этот месяц:\n"]
-        for category, limit_amount in rows:
-            spent = get_month_spent_for_category(user_id, category)
-            ratio = spent / limit_amount if limit_amount > 0 else 0
-            mark = "🔴" if spent > limit_amount else ("🟡" if ratio >= 0.8 else "🟢")
-            lines.append(f"{mark} {category}: {spent:.2f} / {limit_amount:.2f}")
-        text = "\n".join(lines)
-
-    await update.message.reply_text(text, reply_markup=limits_menu_keyboard())
-
-
-async def limits_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    action = query.data.split(":", 1)[1]
-
-    if action == "close":
-        await query.edit_message_text("Закрыто.")
-        return ConversationHandler.END
-
-    if action == "set":
-        await query.edit_message_text(
-            "Выбери категорию, для которой хочешь задать месячный лимит:",
-            reply_markup=categories_inline_keyboard(query.from_user.id, "limitcat"),
-        )
-        return LIMIT_WAITING_CATEGORY
-
-    return ConversationHandler.END
-
-
-async def limit_category_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    choice = query.data.split(":", 1)[1]
-
-    if choice == "cancel":
-        await query.edit_message_text("Отменено.")
-        return ConversationHandler.END
-
-    context.user_data["pending_limit_category"] = choice
-    await query.edit_message_text(
-        f"Категория: {choice}\nВведи сумму месячного лимита (например: 15000):"
-    )
-    return LIMIT_WAITING_AMOUNT
-
-
-async def limit_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().replace(",", ".")
-    try:
-        amount = float(text)
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("Нужно ввести положительное число, например: 15000")
-        return LIMIT_WAITING_AMOUNT
-
-    category = context.user_data.pop("pending_limit_category", None)
-    if not category:
-        await update.message.reply_text("Что-то пошло не так, начни заново через 🎯 Лимиты.")
-        return ConversationHandler.END
-
-    set_limit(update.effective_user.id, category, amount)
-    await update.message.reply_text(
-        f"Лимит установлен: {category} — {amount:.2f} в месяц.",
-        reply_markup=MAIN_KEYBOARD,
-    )
-    return ConversationHandler.END
-
-
-# ---------- Управление категориями ----------
-
-async def categories_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
     await update.message.reply_text(
         "Твои категории:\n✏️ — переименовать, 🗑 — удалить",
-        reply_markup=categories_manage_keyboard(user_id),
+        reply_markup=InlineKeyboardMarkup(buttons),
     )
 
 
-async def categories_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data == "catmgr:close":
-        await query.edit_message_text("Закрыто.")
-        return ConversationHandler.END
-
-    if data == "catnoop":
-        return None
-
-    if data == "catadd:new":
-        await query.edit_message_text("Введи название новой категории (можно с эмодзи):")
-        return CATMGR_WAITING_NEW_NAME
-
-    if data.startswith("catedit:"):
-        old_name = data.split(":", 1)[1]
-        context.user_data["pending_rename_category"] = old_name
-        await query.edit_message_text(f"Введи новое название для категории «{old_name}»:")
-        return CATMGR_WAITING_RENAME
-
-    if data.startswith("catdel:"):
-        name = data.split(":", 1)[1]
-        delete_category(query.from_user.id, name)
-        await query.edit_message_text(
-            f"Категория «{name}» удалена. Уже добавленные расходы в этой категории остаются в истории.",
-            reply_markup=categories_manage_keyboard(query.from_user.id),
-        )
-        return ConversationHandler.END
-
-    return ConversationHandler.END
-
-
-async def category_new_name_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.message.text.strip()
-    if not name:
-        await update.message.reply_text("Название не может быть пустым, попробуй ещё раз:")
-        return CATMGR_WAITING_NEW_NAME
-
-    user_id = update.effective_user.id
-    ok = add_category(user_id, name)
-    if ok:
-        await update.message.reply_text(
-            f"Категория «{name}» добавлена.",
-            reply_markup=categories_manage_keyboard(user_id),
-        )
-    else:
-        await update.message.reply_text(
-            f"Такая категория уже есть. Попробуй другое название:",
-        )
-        return CATMGR_WAITING_NEW_NAME
-    return ConversationHandler.END
-
-
-async def category_rename_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    new_name = update.message.text.strip()
-    old_name = context.user_data.pop("pending_rename_category", None)
-    if not old_name or not new_name:
-        await update.message.reply_text("Что-то пошло не так, начни заново через ⚙️ Категории.")
-        return ConversationHandler.END
-
-    user_id = update.effective_user.id
-    ok = rename_category(user_id, old_name, new_name)
-    if ok:
-        await update.message.reply_text(
-            f"Категория «{old_name}» переименована в «{new_name}». "
-            f"История расходов и лимит по этой категории сохранены.",
-            reply_markup=categories_manage_keyboard(user_id),
-        )
-    else:
-        await update.message.reply_text(
-            "Не получилось переименовать (возможно, такое название уже есть). Попробуй другое:"
-        )
-        context.user_data["pending_rename_category"] = old_name
-        return CATMGR_WAITING_RENAME
-    return ConversationHandler.END
-
-
-# ---------- Прочие команды ----------
-
-async def undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    ok = delete_last_expense(user_id)
-    if ok:
-        await update.message.reply_text("Последняя запись удалена.")
-    else:
-        await update.message.reply_text("У тебя ещё нет записей.")
-
-
-def format_summary(rows, title):
-    if not rows:
-        return f"{title}: записей пока нет."
-
-    total = sum(r[0] for r in rows)
-    by_category = {}
-    for amount, category, _ in rows:
-        by_category[category] = by_category.get(category, 0) + amount
-
-    lines = [f"{title}", f"Всего: {total:.2f}", ""]
-    for cat, amt in sorted(by_category.items(), key=lambda x: -x[1]):
-        lines.append(f"• {cat}: {amt:.2f}")
-    return "\n".join(lines)
-
-
-async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    since = datetime.combine(date.today(), datetime.min.time())
-    rows = get_expenses(user_id, since)
-    await update.message.reply_text(format_summary(rows, "Расходы за сегодня"))
-
-
-async def month(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    since = datetime.combine(date.today().replace(day=1), datetime.min.time())
-    rows = get_expenses(user_id, since)
-    await update.message.reply_text(format_summary(rows, "Расходы за месяц"))
-
-
-async def recurring_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_recurring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     rows = get_recurring(user_id)
     today_day = date.today().day
@@ -1260,34 +728,328 @@ async def recurring_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         text = "Регулярных платежей пока нет."
     else:
+        import calendar
+        days_in_month = calendar.monthrange(date.today().year, date.today().month)[1]
         lines = ["🔄 Регулярные платежи:\n"]
         for rec_id, name, amount, category, day, last_added in rows:
             days_left = day - today_day
             if days_left < 0:
-                import calendar
-                days_in_month = calendar.monthrange(date.today().year, date.today().month)[1]
                 days_left = days_in_month - today_day + day
-            if days_left == 0:
-                marker = "🔴 Сегодня!"
-            elif days_left <= 3:
-                marker = f"🟡 через {days_left} дн."
-            else:
-                marker = f"🟢 {day}-го числа"
-            lines.append(f"{marker} {name} — {amount:.0f} ({category})")
+            mark = "🔴 Сегодня!" if days_left == 0 else (
+                f"🟡 через {days_left} дн." if days_left <= 3 else f"🟢 {day}-го числа"
+            )
+            lines.append(f"{mark}  {name} — {amount:.0f} ({category})")
         text = "\n".join(lines)
 
     buttons = []
     for rec_id, name, amount, category, day, last_added in rows:
-        buttons.append([
-            InlineKeyboardButton(f"🗑 {name}", callback_data=f"recdel:{rec_id}"),
-        ])
+        buttons.append([InlineKeyboardButton(f"🗑 Удалить: {name}", callback_data=f"recdel:{rec_id}")])
     buttons.append([InlineKeyboardButton("➕ Добавить шаблон", callback_data="recadd:new")])
     buttons.append([InlineKeyboardButton("🚫 Закрыть", callback_data="recmgr:close")])
-
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 
-async def recurring_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ──────────────────────────────────────────────
+# ДИАЛОГ: ДОБАВИТЬ РАСХОД
+# ──────────────────────────────────────────────
+async def exp_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Введи сумму расхода (например: 350):")
+    return EXP_AMOUNT
+
+
+async def exp_add_quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        return await exp_start(update, context)
+    if len(args) < 2:
+        await update.message.reply_text("Формат: /add 350 кафе")
+        return ConversationHandler.END
+    try:
+        amount = float(args[0].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("Сумма должна быть числом.")
+        return ConversationHandler.END
+    category = " ".join(args[1:])
+    user_id = update.effective_user.id
+    add_expense(user_id, amount, category)
+    await update.message.reply_text(f"Добавлено: {amount:.2f} — {category}")
+    await warn_limit(user_id, category, update.message.reply_text)
+    return ConversationHandler.END
+
+
+async def exp_got_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().replace(",", ".")
+    try:
+        amount = float(text)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Введи число, например: 350")
+        return EXP_AMOUNT
+    context.user_data["exp_amount"] = amount
+    cats = get_user_categories(update.effective_user.id)
+    await update.message.reply_text(
+        f"Сумма: {amount:.2f}\nВыбери категорию:",
+        reply_markup=make_kb(
+            cats, "expcat",
+            extra_buttons=[InlineKeyboardButton("✏️ Своя категория", callback_data="expcat:__custom__")],
+        ),
+    )
+    return EXP_CATEGORY
+
+
+async def exp_got_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+
+    if choice == "__cancel__":
+        context.user_data.pop("exp_amount", None)
+        await query.edit_message_text("Отменено.")
+        return ConversationHandler.END
+
+    if choice == "__custom__":
+        await query.edit_message_text("Введи название категории:")
+        return EXP_CUSTOM_CAT
+
+    amount = context.user_data.pop("exp_amount", None)
+    if amount is None:
+        await query.edit_message_text("Что-то пошло не так. Начни заново.")
+        return ConversationHandler.END
+
+    user_id = query.from_user.id
+    add_expense(user_id, amount, choice)
+    await query.edit_message_text(f"Добавлено: {amount:.2f} — {choice}")
+    await warn_limit(user_id, choice,
+                     lambda t: context.bot.send_message(chat_id=query.message.chat_id, text=t))
+    return ConversationHandler.END
+
+
+async def exp_got_custom_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    category = update.message.text.strip()
+    amount = context.user_data.pop("exp_amount", None)
+    if not category or amount is None:
+        await update.message.reply_text("Что-то пошло не так. Начни заново.")
+        return ConversationHandler.END
+    user_id = update.effective_user.id
+    add_expense(user_id, amount, category)
+    await update.message.reply_text(f"Добавлено: {amount:.2f} — {category}")
+    await warn_limit(user_id, category, update.message.reply_text)
+    return ConversationHandler.END
+
+
+# ──────────────────────────────────────────────
+# ДИАЛОГ: ДОБАВИТЬ ДОХОД
+# ──────────────────────────────────────────────
+async def inc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Введи сумму дохода (например: 50000):")
+    return INC_AMOUNT
+
+
+async def inc_add_quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        return await inc_start(update, context)
+    if len(args) < 2:
+        await update.message.reply_text("Формат: /income 50000 зарплата")
+        return ConversationHandler.END
+    try:
+        amount = float(args[0].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("Сумма должна быть числом.")
+        return ConversationHandler.END
+    source = " ".join(args[1:])
+    add_income(update.effective_user.id, amount, source)
+    await update.message.reply_text(f"Доход записан: +{amount:.2f} — {source}")
+    return ConversationHandler.END
+
+
+async def inc_got_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().replace(",", ".")
+    try:
+        amount = float(text)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Введи число, например: 50000")
+        return INC_AMOUNT
+    context.user_data["inc_amount"] = amount
+    await update.message.reply_text(
+        f"Сумма: {amount:.2f}\nВыбери источник дохода:",
+        reply_markup=make_kb(
+            INCOME_SOURCES, "incsrc",
+            extra_buttons=[InlineKeyboardButton("✏️ Свой источник", callback_data="incsrc:__custom__")],
+        ),
+    )
+    return INC_SOURCE
+
+
+async def inc_got_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+
+    if choice == "__cancel__":
+        context.user_data.pop("inc_amount", None)
+        await query.edit_message_text("Отменено.")
+        return ConversationHandler.END
+
+    if choice == "__custom__":
+        await query.edit_message_text("Введи название источника дохода:")
+        return INC_CUSTOM_SRC
+
+    amount = context.user_data.pop("inc_amount", None)
+    if amount is None:
+        await query.edit_message_text("Что-то пошло не так. Начни заново.")
+        return ConversationHandler.END
+    add_income(query.from_user.id, amount, choice)
+    await query.edit_message_text(f"Доход записан: +{amount:.2f} — {choice}")
+    return ConversationHandler.END
+
+
+async def inc_got_custom_src(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    source = update.message.text.strip()
+    amount = context.user_data.pop("inc_amount", None)
+    if not source or amount is None:
+        await update.message.reply_text("Что-то пошло не так. Начни заново.")
+        return ConversationHandler.END
+    add_income(update.effective_user.id, amount, source)
+    await update.message.reply_text(f"Доход записан: +{amount:.2f} — {source}")
+    return ConversationHandler.END
+
+
+# ──────────────────────────────────────────────
+# ДИАЛОГ: ЛИМИТЫ
+# ──────────────────────────────────────────────
+async def cb_limitmenu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+    if action == "close":
+        await query.edit_message_text("Закрыто.")
+        return ConversationHandler.END
+    cats = get_user_categories(query.from_user.id)
+    await query.edit_message_text(
+        "Выбери категорию для лимита:",
+        reply_markup=make_kb(cats, "limcat"),
+    )
+    return LIM_CATEGORY
+
+
+async def lim_got_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+    if choice == "__cancel__":
+        await query.edit_message_text("Отменено.")
+        return ConversationHandler.END
+    context.user_data["lim_cat"] = choice
+    await query.edit_message_text(f"Категория: {choice}\nВведи сумму лимита на месяц:")
+    return LIM_AMOUNT
+
+
+async def lim_got_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().replace(",", ".")
+    try:
+        amount = float(text)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Введи положительное число:")
+        return LIM_AMOUNT
+    cat = context.user_data.pop("lim_cat", None)
+    if not cat:
+        await update.message.reply_text("Что-то пошло не так. Начни заново.")
+        return ConversationHandler.END
+    set_limit(update.effective_user.id, cat, amount)
+    await update.message.reply_text(f"Лимит установлен: {cat} — {amount:.2f}/мес.")
+    return ConversationHandler.END
+
+
+# ──────────────────────────────────────────────
+# ДИАЛОГ: УПРАВЛЕНИЕ КАТЕГОРИЯМИ
+# ──────────────────────────────────────────────
+async def cb_catmgr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = query.from_user.id
+
+    if data == "catmgr:close" or data == "catnoop":
+        if data == "catmgr:close":
+            await query.edit_message_text("Закрыто.")
+        return ConversationHandler.END
+
+    if data == "catadd:new":
+        await query.edit_message_text("Введи название новой категории:")
+        return CAT_NEW_NAME
+
+    if data.startswith("catedit:"):
+        old = data.split(":", 1)[1]
+        context.user_data["cat_rename_old"] = old
+        await query.edit_message_text(f"Новое название для «{old}»:")
+        return CAT_RENAME
+
+    if data.startswith("catdel:"):
+        name = data.split(":", 1)[1]
+        delete_category(user_id, name)
+        cats = get_user_categories(user_id)
+        buttons = []
+        for cat in cats:
+            buttons.append([
+                InlineKeyboardButton(cat, callback_data="catnoop"),
+                InlineKeyboardButton("✏️", callback_data=f"catedit:{cat}"),
+                InlineKeyboardButton("🗑", callback_data=f"catdel:{cat}"),
+            ])
+        buttons.append([InlineKeyboardButton("➕ Добавить категорию", callback_data="catadd:new")])
+        buttons.append([InlineKeyboardButton("🚫 Закрыть", callback_data="catmgr:close")])
+        await query.edit_message_text(
+            f"Категория «{name}» удалена.",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return ConversationHandler.END
+
+    return ConversationHandler.END
+
+
+async def cat_got_new_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("Название не может быть пустым:")
+        return CAT_NEW_NAME
+    user_id = update.effective_user.id
+    ok = add_category(user_id, name)
+    if ok:
+        await update.message.reply_text(f"Категория «{name}» добавлена.", reply_markup=MAIN_KEYBOARD)
+    else:
+        await update.message.reply_text("Такая категория уже есть. Введи другое название:")
+        return CAT_NEW_NAME
+    return ConversationHandler.END
+
+
+async def cat_got_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_name = update.message.text.strip()
+    old_name = context.user_data.pop("cat_rename_old", None)
+    if not old_name or not new_name:
+        await update.message.reply_text("Что-то пошло не так. Начни заново.")
+        return ConversationHandler.END
+    user_id = update.effective_user.id
+    ok = rename_category(user_id, old_name, new_name)
+    if ok:
+        await update.message.reply_text(
+            f"«{old_name}» переименовано в «{new_name}».", reply_markup=MAIN_KEYBOARD
+        )
+    else:
+        await update.message.reply_text("Не вышло. Попробуй другое название:")
+        context.user_data["cat_rename_old"] = old_name
+        return CAT_RENAME
+    return ConversationHandler.END
+
+
+# ──────────────────────────────────────────────
+# ДИАЛОГ: РЕГУЛЯРНЫЕ ПЛАТЕЖИ
+# ──────────────────────────────────────────────
+async def cb_recmgr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -1297,10 +1059,8 @@ async def recurring_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
 
     if data == "recadd:new":
-        await query.edit_message_text(
-            "Введи название платежа (например: Аренда квартиры, Netflix, Интернет):"
-        )
-        return REC_WAITING_NAME
+        await query.edit_message_text("Введи название платежа (например: Аренда, Netflix):")
+        return REC_NAME
 
     if data.startswith("recdel:"):
         rec_id = int(data.split(":")[1])
@@ -1311,53 +1071,51 @@ async def recurring_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 
-async def rec_name_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def rec_got_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
     if not name:
-        await update.message.reply_text("Название не может быть пустым, попробуй ещё раз:")
-        return REC_WAITING_NAME
+        await update.message.reply_text("Название не может быть пустым:")
+        return REC_NAME
     context.user_data["rec_name"] = name
     await update.message.reply_text(f"Название: {name}\nВведи сумму платежа:")
-    return REC_WAITING_AMOUNT
+    return REC_AMOUNT
 
 
-async def rec_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def rec_got_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip().replace(",", ".")
     try:
         amount = float(text)
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("Нужно ввести положительное число, например: 1500")
-        return REC_WAITING_AMOUNT
+        await update.message.reply_text("Введи положительное число:")
+        return REC_AMOUNT
     context.user_data["rec_amount"] = amount
+    cats = get_user_categories(update.effective_user.id)
     await update.message.reply_text(
         f"Сумма: {amount:.2f}\nВыбери категорию:",
-        reply_markup=categories_inline_keyboard(update.effective_user.id, "reccat"),
+        reply_markup=make_kb(cats, "reccat"),
     )
-    return REC_WAITING_CATEGORY
+    return REC_CATEGORY
 
 
-async def rec_category_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def rec_got_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     choice = query.data.split(":", 1)[1]
-
-    if choice == "cancel":
+    if choice == "__cancel__":
         context.user_data.pop("rec_name", None)
         context.user_data.pop("rec_amount", None)
-        await query.edit_message_text("Добавление шаблона отменено.")
+        await query.edit_message_text("Отменено.")
         return ConversationHandler.END
-
-    context.user_data["rec_category"] = choice
+    context.user_data["rec_cat"] = choice
     await query.edit_message_text(
-        f"Категория: {choice}\n"
-        "Введи число месяца, в которое добавлять этот расход (от 1 до 28):"
+        f"Категория: {choice}\nВведи день месяца для платежа (от 1 до 28):"
     )
-    return REC_WAITING_DAY
+    return REC_DAY
 
 
-async def rec_day_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def rec_got_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     try:
         day = int(text)
@@ -1365,227 +1123,199 @@ async def rec_day_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise ValueError
     except ValueError:
         await update.message.reply_text("Введи число от 1 до 28:")
-        return REC_WAITING_DAY
+        return REC_DAY
 
     name = context.user_data.pop("rec_name", None)
     amount = context.user_data.pop("rec_amount", None)
-    category = context.user_data.pop("rec_category", None)
-
+    category = context.user_data.pop("rec_cat", None)
     if not all([name, amount, category]):
-        await update.message.reply_text("Что-то пошло не так, начни заново через 🔄 Регулярные платежи.")
+        await update.message.reply_text("Что-то пошло не так. Начни заново.")
         return ConversationHandler.END
 
     add_recurring(update.effective_user.id, name, amount, category, day)
     await update.message.reply_text(
-        f"✅ Шаблон создан!\n"
-        f"• {name}\n"
-        f"• Сумма: {amount:.2f}\n"
-        f"• Категория: {category}\n"
-        f"• Дата: каждый месяц {day}-го числа\n\n"
-        f"Бот автоматически добавит этот расход и пришлёт напоминание за 3 дня.",
+        f"✅ Шаблон создан:\n• {name}\n• {amount:.2f}\n• {category}\n• Каждый месяц {day}-го числа\n\n"
+        f"Бот автоматически добавит расход и пришлёт напоминание за 3 дня.",
         reply_markup=MAIN_KEYBOARD,
     )
     return ConversationHandler.END
 
 
-# ---------- Планировщик: автоматические расходы и напоминания ----------
-
-async def check_recurring_job(context):
-    """Запускается раз в сутки. Добавляет расходы и шлёт напоминания."""
+# ──────────────────────────────────────────────
+# ПЛАНИРОВЩИК
+# ──────────────────────────────────────────────
+async def job_check_recurring(context):
     today = date.today()
-    rows = get_all_recurring()
-
-    for rec_id, user_id, name, amount, category, day, last_added in rows:
-        # Автоматически добавить расход в нужный день
+    import calendar
+    days_in_month = calendar.monthrange(today.year, today.month)[1]
+    for rec_id, user_id, name, amount, category, day, last_added in get_all_recurring():
         if today.day == day:
-            if last_added is None or (
-                isinstance(last_added, date) and
-                (last_added.year, last_added.month) != (today.year, today.month)
-            ):
+            if last_added is None or (last_added.year, last_added.month) != (today.year, today.month):
                 add_expense(user_id, amount, category)
                 mark_recurring_added(rec_id, today)
                 try:
                     await context.bot.send_message(
                         chat_id=user_id,
-                        text=(
-                            f"🔄 Автоматически добавлен регулярный расход:\n"
-                            f"• {name} — {amount:.2f} ({category})"
-                        ),
+                        text=f"🔄 Автоматически добавлен платёж:\n• {name} — {amount:.2f} ({category})",
                     )
                 except Exception:
                     pass
-
-        # Напоминание за 3 дня
         elif today.day == day - 3:
             try:
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=(
-                        f"🔔 Напоминание: через 3 дня ({day}-го числа) "
-                        f"запланирован платёж «{name}» на {amount:.2f} ({category})."
-                    ),
+                    text=f"🔔 Через 3 дня ({day}-го) платёж «{name}» — {amount:.2f} ({category}).",
                 )
             except Exception:
                 pass
 
 
-async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ──────────────────────────────────────────────
+# ОБЩИЙ ОБРАБОТЧИК КНОПОК МЕНЮ
+# ──────────────────────────────────────────────
+async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if text == "📊 За сегодня":
-        await today(update, context)
+        await cmd_today(update, context)
     elif text == "📅 За месяц":
-        await month(update, context)
+        await cmd_month(update, context)
     elif text == "❌ Удалить последнюю":
-        await undo(update, context)
+        await cmd_undo(update, context)
     elif text == "ℹ️ Помощь":
-        await help_cmd(update, context)
-    elif text == "🔄 Регулярные платежи":
-        await recurring_open(update, context)
-    elif text == "💵 Добавить доход":
-        await income_start(update, context)
+        await cmd_start(update, context)
     elif text == "💰 Баланс":
-        await balance(update, context)
+        await cmd_balance(update, context)
     elif text == "📈 Графики":
-        await charts_open(update, context)
+        await cmd_charts(update, context)
     elif text == "🎯 Лимиты":
-        await limits_open(update, context)
+        await cmd_limits(update, context)
     elif text == "⚙️ Категории":
-        await categories_open(update, context)
+        await cmd_categories(update, context)
+    elif text == "🔄 Регулярные платежи":
+        await cmd_recurring(update, context)
 
 
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
+    return ConversationHandler.END
+
+
+# ──────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────
 def main():
     init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    add_conversation = ConversationHandler(
-        entry_points=[
-            CommandHandler("add", add_quick),
-            MessageHandler(filters.Regex("^➕ Добавить расход$"), add_start),
-        ],
-        states={
-            WAITING_AMOUNT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, amount_received)
-            ],
-            WAITING_CATEGORY: [
-                CallbackQueryHandler(category_chosen, pattern=r"^cat:")
-            ],
-            WAITING_CUSTOM_CATEGORY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, custom_category_received)
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel_conversation),
-            MessageHandler(filters.Regex(MENU_BUTTONS_PATTERN), menu_button_fallback),
-        ],
+    # Паттерн для кнопок меню — используется как fallback в диалогах
+    MENU_PAT = (
+        "^(📊 За сегодня|📅 За месяц|❌ Удалить последнюю|ℹ️ Помощь|"
+        "💰 Баланс|📈 Графики|🎯 Лимиты|⚙️ Категории|"
+        "🔄 Регулярные платежи|💵 Добавить доход|➕ Добавить расход)$"
     )
 
-    limit_conversation = ConversationHandler(
+    def make_fallbacks():
+        return [
+            CommandHandler("cancel", cmd_cancel),
+            MessageHandler(filters.Regex(MENU_PAT), cmd_cancel),
+        ]
+
+    # Диалог: расход
+    exp_conv = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(limits_menu_callback, pattern=r"^limitmenu:"),
+            CommandHandler("add", exp_add_quick),
+            MessageHandler(filters.Regex("^➕ Добавить расход$"), exp_start),
         ],
         states={
-            LIMIT_WAITING_CATEGORY: [
-                CallbackQueryHandler(limit_category_chosen, pattern=r"^limitcat:")
-            ],
-            LIMIT_WAITING_AMOUNT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, limit_amount_received)
-            ],
+            EXP_AMOUNT:     [MessageHandler(filters.TEXT & ~filters.COMMAND, exp_got_amount)],
+            EXP_CATEGORY:   [CallbackQueryHandler(exp_got_category, pattern=r"^expcat:")],
+            EXP_CUSTOM_CAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, exp_got_custom_cat)],
         },
-        fallbacks=[
-            CommandHandler("cancel", cancel_conversation),
-            MessageHandler(filters.Regex(MENU_BUTTONS_PATTERN), menu_button_fallback),
+        fallbacks=make_fallbacks(),
+        allow_reentry=True,
+    )
+
+    # Диалог: доход
+    inc_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("income", inc_add_quick),
+            MessageHandler(filters.Regex("^💵 Добавить доход$"), inc_start),
         ],
+        states={
+            INC_AMOUNT:     [MessageHandler(filters.TEXT & ~filters.COMMAND, inc_got_amount)],
+            INC_SOURCE:     [CallbackQueryHandler(inc_got_source, pattern=r"^incsrc:")],
+            INC_CUSTOM_SRC: [MessageHandler(filters.TEXT & ~filters.COMMAND, inc_got_custom_src)],
+        },
+        fallbacks=make_fallbacks(),
+        allow_reentry=True,
+    )
+
+    # Диалог: лимиты
+    lim_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(cb_limitmenu, pattern=r"^limitmenu:")],
+        states={
+            LIM_CATEGORY: [CallbackQueryHandler(lim_got_category, pattern=r"^limcat:")],
+            LIM_AMOUNT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, lim_got_amount)],
+        },
+        fallbacks=make_fallbacks(),
         per_message=False,
+        allow_reentry=True,
     )
 
-    category_manage_conversation = ConversationHandler(
+    # Диалог: категории
+    cat_conv = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(
-                categories_manage_callback,
-                pattern=r"^(catmgr:|catadd:|catedit:|catdel:|catnoop)",
-            ),
+            CallbackQueryHandler(cb_catmgr, pattern=r"^(catmgr:|catadd:|catedit:|catdel:|catnoop)"),
         ],
         states={
-            CATMGR_WAITING_NEW_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, category_new_name_received)
-            ],
-            CATMGR_WAITING_RENAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, category_rename_received)
-            ],
+            CAT_NEW_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, cat_got_new_name)],
+            CAT_RENAME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, cat_got_rename)],
         },
-        fallbacks=[
-            CommandHandler("cancel", cancel_conversation),
-            MessageHandler(filters.Regex(MENU_BUTTONS_PATTERN), menu_button_fallback),
-        ],
+        fallbacks=make_fallbacks(),
         per_message=False,
+        allow_reentry=True,
     )
 
-    income_conversation = ConversationHandler(
+    # Диалог: регулярные платежи
+    rec_conv = ConversationHandler(
         entry_points=[
-            CommandHandler("income", income_quick),
-            MessageHandler(filters.Regex("^💵 Добавить доход$"), income_start),
+            CallbackQueryHandler(cb_recmgr, pattern=r"^(recadd:|recdel:|recmgr:)"),
         ],
         states={
-            INCOME_WAITING_AMOUNT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, income_amount_received)
-            ],
-            INCOME_WAITING_SOURCE: [
-                CallbackQueryHandler(income_source_chosen, pattern=r"^inc:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, income_custom_source_received),
-            ],
+            REC_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, rec_got_name)],
+            REC_AMOUNT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, rec_got_amount)],
+            REC_CATEGORY: [CallbackQueryHandler(rec_got_category, pattern=r"^reccat:")],
+            REC_DAY:      [MessageHandler(filters.TEXT & ~filters.COMMAND, rec_got_day)],
         },
-        fallbacks=[
-            CommandHandler("cancel", cancel_conversation),
-            MessageHandler(filters.Regex(MENU_BUTTONS_PATTERN), menu_button_fallback),
-        ],
-    )
-
-    recurring_conversation = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(recurring_callback, pattern=r"^(recadd:|recdel:|recmgr:)"),
-        ],
-        states={
-            REC_WAITING_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, rec_name_received)
-            ],
-            REC_WAITING_AMOUNT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, rec_amount_received)
-            ],
-            REC_WAITING_CATEGORY: [
-                CallbackQueryHandler(rec_category_chosen, pattern=r"^reccat:")
-            ],
-            REC_WAITING_DAY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, rec_day_received)
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel_conversation),
-            MessageHandler(filters.Regex(MENU_BUTTONS_PATTERN), menu_button_fallback),
-        ],
+        fallbacks=make_fallbacks(),
         per_message=False,
+        allow_reentry=True,
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(add_conversation)
-    app.add_handler(income_conversation)
-    app.add_handler(limit_conversation)
-    app.add_handler(category_manage_conversation)
-    app.add_handler(recurring_conversation)
-    app.add_handler(CallbackQueryHandler(chart_callback, pattern=r"^chart:"))
-    app.add_handler(CommandHandler("today", today))
-    app.add_handler(CommandHandler("month", month))
-    app.add_handler(CommandHandler("balance", balance))
-    app.add_handler(CommandHandler("undo", undo))
-    app.add_handler(CommandHandler("limits", limits_open))
-    app.add_handler(CommandHandler("categories", categories_open))
-    app.add_handler(CommandHandler("charts", charts_open))
-    app.add_handler(CommandHandler("recurring", recurring_open))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_start))
+    app.add_handler(CommandHandler("today", cmd_today))
+    app.add_handler(CommandHandler("month", cmd_month))
+    app.add_handler(CommandHandler("undo", cmd_undo))
+    app.add_handler(CommandHandler("balance", cmd_balance))
+    app.add_handler(CommandHandler("charts", cmd_charts))
+    app.add_handler(CommandHandler("limits", cmd_limits))
+    app.add_handler(CommandHandler("categories", cmd_categories))
+    app.add_handler(CommandHandler("recurring", cmd_recurring))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
 
-    # Планировщик — проверка регулярных платежей раз в сутки в 09:00
+    app.add_handler(exp_conv)
+    app.add_handler(inc_conv)
+    app.add_handler(lim_conv)
+    app.add_handler(cat_conv)
+    app.add_handler(rec_conv)
+
+    app.add_handler(CallbackQueryHandler(cb_chart, pattern=r"^chart:"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
+
     app.job_queue.run_daily(
-        check_recurring_job,
+        job_check_recurring,
         time=datetime.strptime("09:00", "%H:%M").time(),
     )
 
