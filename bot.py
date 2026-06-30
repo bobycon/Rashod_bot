@@ -97,6 +97,17 @@ def init_db():
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS incomes (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                amount DOUBLE PRECISION NOT NULL,
+                source TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL
+            )
+            """
+        )
         conn.commit()
         cur.close()
     finally:
@@ -183,6 +194,76 @@ def get_expenses_by_category(user_id: int, since):
         return rows
     finally:
         conn.close()
+
+
+def add_income(user_id: int, amount: float, source: str):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO incomes (user_id, amount, source, created_at) VALUES (%s, %s, %s, %s)",
+            (user_id, amount, source, datetime.now()),
+        )
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
+def delete_last_income(user_id: int):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id FROM incomes WHERE user_id = %s ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        if row:
+            cur.execute("DELETE FROM incomes WHERE id = %s", (row[0],))
+        conn.commit()
+        cur.close()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def get_incomes(user_id: int, since):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT amount, source, created_at FROM incomes "
+            "WHERE user_id = %s AND created_at >= %s ORDER BY created_at DESC",
+            (user_id, since),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+    finally:
+        conn.close()
+
+
+def get_balance(user_id: int, since):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM incomes WHERE user_id = %s AND created_at >= %s",
+            (user_id, since),
+        )
+        total_income = float(cur.fetchone()[0])
+        cur.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE user_id = %s AND created_at >= %s",
+            (user_id, since),
+        )
+        total_expense = float(cur.fetchone()[0])
+        cur.close()
+        return total_income, total_expense
+    finally:
+        conn.close()
+
+
     since = datetime.combine(date.today().replace(day=1), datetime.min.time())
     conn = get_conn()
     try:
@@ -360,20 +441,45 @@ def delete_category(user_id: int, name: str):
 WAITING_AMOUNT, WAITING_CATEGORY, WAITING_CUSTOM_CATEGORY = range(3)
 LIMIT_WAITING_CATEGORY, LIMIT_WAITING_AMOUNT = range(3, 5)
 CATMGR_WAITING_NEW_NAME, CATMGR_WAITING_RENAME = range(5, 7)
+INCOME_WAITING_AMOUNT, INCOME_WAITING_SOURCE = range(7, 9)
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["➕ Добавить расход"],
+        ["➕ Добавить расход", "💵 Добавить доход"],
         ["📊 За сегодня", "📅 За месяц"],
-        ["📈 Графики", "🎯 Лимиты"],
-        ["⚙️ Категории", "❌ Удалить последнюю"],
-        ["ℹ️ Помощь"],
+        ["💰 Баланс", "📈 Графики"],
+        ["🎯 Лимиты", "⚙️ Категории"],
+        ["❌ Удалить последнюю", "ℹ️ Помощь"],
     ],
     resize_keyboard=True,
 )
 
 
-def categories_inline_keyboard(user_id: int, prefix="cat"):
+INCOME_SOURCES = [
+    "💼 Зарплата",
+    "🎁 Подарок",
+    "📈 Инвестиции",
+    "🏠 Аренда",
+    "💻 Фриланс",
+    "🏦 Кешбэк/проценты",
+    "🛍 Продажа",
+    "💰 Прочее",
+]
+
+
+def income_sources_keyboard():
+    buttons = []
+    row = []
+    for i, src in enumerate(INCOME_SOURCES, 1):
+        row.append(InlineKeyboardButton(src, callback_data=f"inc:{src}"))
+        if i % 2 == 0:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("✏️ Свой источник", callback_data="inc:custom")])
+    buttons.append([InlineKeyboardButton("🚫 Отмена", callback_data="inc:cancel")])
+    return InlineKeyboardMarkup(buttons)
     cats = get_user_categories(user_id)
     buttons = []
     row = []
@@ -585,6 +691,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я помогу вести учёт расходов.\n\n"
         "➕ Добавить расход — записать трату по шагам\n"
+        "💵 Добавить доход — записать доход по шагам или /income 50000 зарплата\n"
+        "💰 Баланс — доходы, расходы и остаток за месяц\n"
         "📈 Графики — круговая диаграмма и график по дням\n"
         "🎯 Лимиты — установить лимит по категории и следить за ним\n"
         "⚙️ Категории — добавить, переименовать или удалить категории\n"
@@ -699,10 +807,129 @@ async def custom_category_received(update: Update, context: ContextTypes.DEFAULT
     return ConversationHandler.END
 
 
+async def income_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Введи сумму дохода (например: 50000 или 1500.50):"
+    )
+    return INCOME_WAITING_AMOUNT
+
+
+async def income_quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        return await income_start(update, context)
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Формат: /income <сумма> <источник>, например /income 50000 зарплата\n"
+            "Либо просто /income без аргументов для пошагового ввода."
+        )
+        return ConversationHandler.END
+    try:
+        amount = float(args[0].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("Сумма должна быть числом, например: /income 50000 зарплата")
+        return ConversationHandler.END
+    source = " ".join(args[1:])
+    add_income(update.effective_user.id, amount, source)
+    await update.message.reply_text(f"Доход записан: +{amount:.2f} — {source}")
+    return ConversationHandler.END
+
+
+async def income_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().replace(",", ".")
+    try:
+        amount = float(text)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Нужно ввести положительное число, например: 50000")
+        return INCOME_WAITING_AMOUNT
+    context.user_data["pending_income"] = amount
+    await update.message.reply_text(
+        f"Сумма: {amount:.2f}\nВыбери источник дохода:",
+        reply_markup=income_sources_keyboard(),
+    )
+    return INCOME_WAITING_SOURCE
+
+
+async def income_source_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+
+    if choice == "cancel":
+        context.user_data.pop("pending_income", None)
+        await query.edit_message_text("Добавление дохода отменено.")
+        return ConversationHandler.END
+
+    if choice == "custom":
+        await query.edit_message_text("Введи название источника дохода текстом:")
+        return INCOME_WAITING_SOURCE
+
+    amount = context.user_data.pop("pending_income", None)
+    if amount is None:
+        await query.edit_message_text("Что-то пошло не так, начни заново через 💵 Добавить доход.")
+        return ConversationHandler.END
+
+    add_income(query.from_user.id, amount, choice)
+    await query.edit_message_text(f"Доход записан: +{amount:.2f} — {choice}")
+    return ConversationHandler.END
+
+
+async def income_custom_source_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    source = update.message.text.strip()
+    amount = context.user_data.pop("pending_income", None)
+    if not source or amount is None:
+        await update.message.reply_text("Что-то пошло не так, начни заново через 💵 Добавить доход.")
+        return ConversationHandler.END
+    add_income(update.effective_user.id, amount, source)
+    await update.message.reply_text(f"Доход записан: +{amount:.2f} — {source}")
+    return ConversationHandler.END
+
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    since = datetime.combine(date.today().replace(day=1), datetime.min.time())
+    income_total, expense_total = get_balance(user_id, since)
+    remaining = income_total - expense_total
+
+    # Доходы по источникам
+    income_rows = get_incomes(user_id, since)
+    by_source = {}
+    for amt, src, _ in income_rows:
+        by_source[src] = by_source.get(src, 0) + amt
+
+    month_name = date.today().strftime("%B %Y")
+    lines = [f"💰 Баланс за {month_name}", ""]
+
+    lines.append("📥 Доходы:")
+    if by_source:
+        for src, amt in sorted(by_source.items(), key=lambda x: -x[1]):
+            lines.append(f"  • {src}: +{amt:.2f}")
+        lines.append(f"  Итого доходов: {income_total:.2f}")
+    else:
+        lines.append("  Доходов пока нет")
+
+    lines.append("")
+    lines.append(f"📤 Расходы: {expense_total:.2f}")
+    lines.append("")
+
+    if income_total == 0:
+        lines.append(f"💳 Остаток: {remaining:.2f}")
+        lines.append("(Добавь доходы через 💵 Добавить доход)")
+    elif remaining >= 0:
+        lines.append(f"✅ Остаток: {remaining:.2f}")
+    else:
+        lines.append(f"🔴 Перерасход: {remaining:.2f}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("pending_amount", None)
     context.user_data.pop("pending_limit_category", None)
     context.user_data.pop("pending_rename_category", None)
+    context.user_data.pop("pending_income", None)
     await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
     return ConversationHandler.END
 
@@ -924,6 +1151,10 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await undo(update, context)
     elif text == "ℹ️ Помощь":
         await help_cmd(update, context)
+    elif text == "💵 Добавить доход":
+        await income_start(update, context)
+    elif text == "💰 Баланс":
+        await balance(update, context)
     elif text == "📈 Графики":
         await charts_open(update, context)
     elif text == "🎯 Лимиты":
@@ -990,14 +1221,33 @@ def main():
         per_message=False,
     )
 
+    income_conversation = ConversationHandler(
+        entry_points=[
+            CommandHandler("income", income_quick),
+            MessageHandler(filters.Regex("^💵 Добавить доход$"), income_start),
+        ],
+        states={
+            INCOME_WAITING_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, income_amount_received)
+            ],
+            INCOME_WAITING_SOURCE: [
+                CallbackQueryHandler(income_source_chosen, pattern=r"^inc:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, income_custom_source_received),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(add_conversation)
+    app.add_handler(income_conversation)
     app.add_handler(limit_conversation)
     app.add_handler(category_manage_conversation)
     app.add_handler(CallbackQueryHandler(chart_callback, pattern=r"^chart:"))
     app.add_handler(CommandHandler("today", today))
     app.add_handler(CommandHandler("month", month))
+    app.add_handler(CommandHandler("balance", balance))
     app.add_handler(CommandHandler("undo", undo))
     app.add_handler(CommandHandler("limits", limits_open))
     app.add_handler(CommandHandler("categories", categories_open))
