@@ -8,6 +8,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from telegram.ext import JobQueue
 
 from telegram import (
     Update,
@@ -105,6 +106,19 @@ def init_db():
                 amount DOUBLE PRECISION NOT NULL,
                 source TEXT NOT NULL,
                 created_at TIMESTAMP NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recurring (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                name TEXT NOT NULL,
+                amount DOUBLE PRECISION NOT NULL,
+                category TEXT NOT NULL,
+                day_of_month INTEGER NOT NULL,
+                last_added DATE
             )
             """
         )
@@ -280,6 +294,82 @@ def get_balance(user_id: int, since):
         conn.close()
 
 
+# ---------- Шаблоны регулярных трат ----------
+
+def add_recurring(user_id: int, name: str, amount: float, category: str, day_of_month: int):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO recurring (user_id, name, amount, category, day_of_month, last_added) "
+            "VALUES (%s, %s, %s, %s, %s, NULL)",
+            (user_id, name, amount, category, day_of_month),
+        )
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
+def get_recurring(user_id: int):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, name, amount, category, day_of_month, last_added "
+            "FROM recurring WHERE user_id = %s ORDER BY day_of_month, name",
+            (user_id,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+    finally:
+        conn.close()
+
+
+def get_all_recurring():
+    """Все шаблоны всех пользователей — для планировщика."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, user_id, name, amount, category, day_of_month, last_added FROM recurring"
+        )
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+    finally:
+        conn.close()
+
+
+def delete_recurring(rec_id: int, user_id: int):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM recurring WHERE id = %s AND user_id = %s",
+            (rec_id, user_id),
+        )
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
+def mark_recurring_added(rec_id: int, added_date: date):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE recurring SET last_added = %s WHERE id = %s",
+            (added_date, rec_id),
+        )
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
 def set_limit(user_id: int, category: str, amount: float):
     conn = get_conn()
     try:
@@ -442,6 +532,7 @@ WAITING_AMOUNT, WAITING_CATEGORY, WAITING_CUSTOM_CATEGORY = range(3)
 LIMIT_WAITING_CATEGORY, LIMIT_WAITING_AMOUNT = range(3, 5)
 CATMGR_WAITING_NEW_NAME, CATMGR_WAITING_RENAME = range(5, 7)
 INCOME_WAITING_AMOUNT, INCOME_WAITING_SOURCE = range(7, 9)
+REC_WAITING_NAME, REC_WAITING_AMOUNT, REC_WAITING_CATEGORY, REC_WAITING_DAY = range(9, 13)
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -449,7 +540,8 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
         ["📊 За сегодня", "📅 За месяц"],
         ["💰 Баланс", "📈 Графики"],
         ["🎯 Лимиты", "⚙️ Категории"],
-        ["❌ Удалить последнюю", "ℹ️ Помощь"],
+        ["🔄 Регулярные платежи", "❌ Удалить последнюю"],
+        ["ℹ️ Помощь"],
     ],
     resize_keyboard=True,
 )
@@ -690,6 +782,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_default_categories(update.effective_user.id)
     await update.message.reply_text(
         "Привет! Я помогу вести учёт расходов.\n\n"
+        "🔄 Регулярные платежи — шаблоны, которые добавляются сами каждый месяц\n"
         "➕ Добавить расход — записать трату по шагам\n"
         "💵 Добавить доход — записать доход по шагам или /income 50000 зарплата\n"
         "💰 Баланс — доходы, расходы и остаток за месяц\n"
@@ -1141,6 +1234,183 @@ async def month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(format_summary(rows, "Расходы за месяц"))
 
 
+async def recurring_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    rows = get_recurring(user_id)
+    today_day = date.today().day
+
+    if not rows:
+        text = "Регулярных платежей пока нет."
+    else:
+        lines = ["🔄 Регулярные платежи:\n"]
+        for rec_id, name, amount, category, day, last_added in rows:
+            days_left = day - today_day
+            if days_left < 0:
+                import calendar
+                days_in_month = calendar.monthrange(date.today().year, date.today().month)[1]
+                days_left = days_in_month - today_day + day
+            if days_left == 0:
+                marker = "🔴 Сегодня!"
+            elif days_left <= 3:
+                marker = f"🟡 через {days_left} дн."
+            else:
+                marker = f"🟢 {day}-го числа"
+            lines.append(f"{marker} {name} — {amount:.0f} ({category})")
+        text = "\n".join(lines)
+
+    buttons = []
+    for rec_id, name, amount, category, day, last_added in rows:
+        buttons.append([
+            InlineKeyboardButton(f"🗑 {name}", callback_data=f"recdel:{rec_id}"),
+        ])
+    buttons.append([InlineKeyboardButton("➕ Добавить шаблон", callback_data="recadd:new")])
+    buttons.append([InlineKeyboardButton("🚫 Закрыть", callback_data="recmgr:close")])
+
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def recurring_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "recmgr:close":
+        await query.edit_message_text("Закрыто.")
+        return ConversationHandler.END
+
+    if data == "recadd:new":
+        await query.edit_message_text(
+            "Введи название платежа (например: Аренда квартиры, Netflix, Интернет):"
+        )
+        return REC_WAITING_NAME
+
+    if data.startswith("recdel:"):
+        rec_id = int(data.split(":")[1])
+        delete_recurring(rec_id, query.from_user.id)
+        await query.edit_message_text("Шаблон удалён.")
+        return ConversationHandler.END
+
+    return ConversationHandler.END
+
+
+async def rec_name_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("Название не может быть пустым, попробуй ещё раз:")
+        return REC_WAITING_NAME
+    context.user_data["rec_name"] = name
+    await update.message.reply_text(f"Название: {name}\nВведи сумму платежа:")
+    return REC_WAITING_AMOUNT
+
+
+async def rec_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().replace(",", ".")
+    try:
+        amount = float(text)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Нужно ввести положительное число, например: 1500")
+        return REC_WAITING_AMOUNT
+    context.user_data["rec_amount"] = amount
+    await update.message.reply_text(
+        f"Сумма: {amount:.2f}\nВыбери категорию:",
+        reply_markup=categories_inline_keyboard(update.effective_user.id, "reccat"),
+    )
+    return REC_WAITING_CATEGORY
+
+
+async def rec_category_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+
+    if choice == "cancel":
+        context.user_data.pop("rec_name", None)
+        context.user_data.pop("rec_amount", None)
+        await query.edit_message_text("Добавление шаблона отменено.")
+        return ConversationHandler.END
+
+    context.user_data["rec_category"] = choice
+    await query.edit_message_text(
+        f"Категория: {choice}\n"
+        "Введи число месяца, в которое добавлять этот расход (от 1 до 28):"
+    )
+    return REC_WAITING_DAY
+
+
+async def rec_day_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        day = int(text)
+        if day < 1 or day > 28:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Введи число от 1 до 28:")
+        return REC_WAITING_DAY
+
+    name = context.user_data.pop("rec_name", None)
+    amount = context.user_data.pop("rec_amount", None)
+    category = context.user_data.pop("rec_category", None)
+
+    if not all([name, amount, category]):
+        await update.message.reply_text("Что-то пошло не так, начни заново через 🔄 Регулярные платежи.")
+        return ConversationHandler.END
+
+    add_recurring(update.effective_user.id, name, amount, category, day)
+    await update.message.reply_text(
+        f"✅ Шаблон создан!\n"
+        f"• {name}\n"
+        f"• Сумма: {amount:.2f}\n"
+        f"• Категория: {category}\n"
+        f"• Дата: каждый месяц {day}-го числа\n\n"
+        f"Бот автоматически добавит этот расход и пришлёт напоминание за 3 дня.",
+        reply_markup=MAIN_KEYBOARD,
+    )
+    return ConversationHandler.END
+
+
+# ---------- Планировщик: автоматические расходы и напоминания ----------
+
+async def check_recurring_job(context):
+    """Запускается раз в сутки. Добавляет расходы и шлёт напоминания."""
+    today = date.today()
+    rows = get_all_recurring()
+
+    for rec_id, user_id, name, amount, category, day, last_added in rows:
+        # Автоматически добавить расход в нужный день
+        if today.day == day:
+            if last_added is None or (
+                isinstance(last_added, date) and
+                (last_added.year, last_added.month) != (today.year, today.month)
+            ):
+                add_expense(user_id, amount, category)
+                mark_recurring_added(rec_id, today)
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=(
+                            f"🔄 Автоматически добавлен регулярный расход:\n"
+                            f"• {name} — {amount:.2f} ({category})"
+                        ),
+                    )
+                except Exception:
+                    pass
+
+        # Напоминание за 3 дня
+        elif today.day == day - 3:
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        f"🔔 Напоминание: через 3 дня ({day}-го числа) "
+                        f"запланирован платёж «{name}» на {amount:.2f} ({category})."
+                    ),
+                )
+            except Exception:
+                pass
+
+
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if text == "📊 За сегодня":
@@ -1151,6 +1421,8 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await undo(update, context)
     elif text == "ℹ️ Помощь":
         await help_cmd(update, context)
+    elif text == "🔄 Регулярные платежи":
+        await recurring_open(update, context)
     elif text == "💵 Добавить доход":
         await income_start(update, context)
     elif text == "💰 Баланс":
@@ -1238,12 +1510,35 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_conversation)],
     )
 
+    recurring_conversation = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(recurring_callback, pattern=r"^(recadd:|recdel:|recmgr:)"),
+        ],
+        states={
+            REC_WAITING_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, rec_name_received)
+            ],
+            REC_WAITING_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, rec_amount_received)
+            ],
+            REC_WAITING_CATEGORY: [
+                CallbackQueryHandler(rec_category_chosen, pattern=r"^reccat:")
+            ],
+            REC_WAITING_DAY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, rec_day_received)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+        per_message=False,
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(add_conversation)
     app.add_handler(income_conversation)
     app.add_handler(limit_conversation)
     app.add_handler(category_manage_conversation)
+    app.add_handler(recurring_conversation)
     app.add_handler(CallbackQueryHandler(chart_callback, pattern=r"^chart:"))
     app.add_handler(CommandHandler("today", today))
     app.add_handler(CommandHandler("month", month))
@@ -1252,7 +1547,14 @@ def main():
     app.add_handler(CommandHandler("limits", limits_open))
     app.add_handler(CommandHandler("categories", categories_open))
     app.add_handler(CommandHandler("charts", charts_open))
+    app.add_handler(CommandHandler("recurring", recurring_open))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
+
+    # Планировщик — проверка регулярных платежей раз в сутки в 09:00
+    app.job_queue.run_daily(
+        check_recurring_job,
+        time=datetime.strptime("09:00", "%H:%M").time(),
+    )
 
     print("Бот запущен...")
     app.run_polling()
