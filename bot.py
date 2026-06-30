@@ -1,8 +1,8 @@
 import os
 from datetime import datetime, date
+from urllib.parse import urlparse
 
-import psycopg2
-from psycopg2 import pool
+import pg8000.dbapi
 
 from telegram import (
     Update,
@@ -29,15 +29,17 @@ if not DATABASE_URL:
         "Подключи PostgreSQL в Railway и добавь ссылку на DATABASE_URL в Variables бота."
     )
 
-db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DATABASE_URL)
+_parsed = urlparse(DATABASE_URL)
 
 
 def get_conn():
-    return db_pool.getconn()
-
-
-def put_conn(conn):
-    db_pool.putconn(conn)
+    return pg8000.dbapi.connect(
+        user=_parsed.username,
+        password=_parsed.password,
+        host=_parsed.hostname,
+        port=_parsed.port or 5432,
+        database=_parsed.path.lstrip("/"),
+    )
 
 
 # ---------- База данных ----------
@@ -45,65 +47,70 @@ def put_conn(conn):
 def init_db():
     conn = get_conn()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS expenses (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    amount DOUBLE PRECISION NOT NULL,
-                    category TEXT NOT NULL,
-                    created_at TIMESTAMP NOT NULL
-                )
-                """
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS expenses (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                amount DOUBLE PRECISION NOT NULL,
+                category TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL
             )
+            """
+        )
         conn.commit()
+        cur.close()
     finally:
-        put_conn(conn)
+        conn.close()
 
 
 def add_expense(user_id: int, amount: float, category: str):
     conn = get_conn()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO expenses (user_id, amount, category, created_at) VALUES (%s, %s, %s, %s)",
-                (user_id, amount, category, datetime.now()),
-            )
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO expenses (user_id, amount, category, created_at) VALUES (%s, %s, %s, %s)",
+            (user_id, amount, category, datetime.now()),
+        )
         conn.commit()
+        cur.close()
     finally:
-        put_conn(conn)
+        conn.close()
 
 
 def delete_last_expense(user_id: int):
     conn = get_conn()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id FROM expenses WHERE user_id = %s ORDER BY id DESC LIMIT 1",
-                (user_id,),
-            )
-            row = cur.fetchone()
-            if row:
-                cur.execute("DELETE FROM expenses WHERE id = %s", (row[0],))
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id FROM expenses WHERE user_id = %s ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        if row:
+            cur.execute("DELETE FROM expenses WHERE id = %s", (row[0],))
         conn.commit()
+        cur.close()
         return row is not None
     finally:
-        put_conn(conn)
+        conn.close()
 
 
 def get_expenses(user_id: int, since):
     conn = get_conn()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT amount, category, created_at FROM expenses "
-                "WHERE user_id = %s AND created_at >= %s ORDER BY created_at DESC",
-                (user_id, since),
-            )
-            return cur.fetchall()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT amount, category, created_at FROM expenses "
+            "WHERE user_id = %s AND created_at >= %s ORDER BY created_at DESC",
+            (user_id, since),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        return rows
     finally:
-        put_conn(conn)
+        conn.close()
 
 
 # ---------- Категории ----------
@@ -119,7 +126,6 @@ CATEGORIES = [
     "🛒 Прочее",
 ]
 
-# Состояния диалога
 WAITING_AMOUNT, WAITING_CATEGORY, WAITING_CUSTOM_CATEGORY = range(3)
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
@@ -169,7 +175,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- Пошаговое добавление расхода ----------
 
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запускает диалог добавления расхода (по кнопке или /add без аргументов)."""
     await update.message.reply_text(
         "Введи сумму расхода (например: 350 или 199.50):"
     )
@@ -177,10 +182,8 @@ async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Старый быстрый формат: /add 500 еда — добавляет сразу, без диалога."""
     args = context.args
     if not args:
-        # Если аргументов нет — запускаем пошаговый диалог
         return await add_start(update, context)
 
     if len(args) < 2:
@@ -225,7 +228,7 @@ async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def category_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data  # "cat:<категория>" или "cat:custom" или "cat:cancel"
+    data = query.data
     choice = data.split(":", 1)[1]
 
     if choice == "cancel":
