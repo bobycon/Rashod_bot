@@ -1,8 +1,13 @@
+import io
 import os
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from urllib.parse import urlparse
 
 import pg8000.dbapi
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 
 from telegram import (
     Update,
@@ -146,7 +151,38 @@ def get_expenses(user_id: int, since):
         conn.close()
 
 
-def get_month_spent_for_category(user_id: int, category: str) -> float:
+def get_expenses_by_day(user_id: int, since, until):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT DATE(created_at), SUM(amount) FROM expenses "
+            "WHERE user_id = %s AND created_at >= %s AND created_at < %s "
+            "GROUP BY DATE(created_at) ORDER BY DATE(created_at)",
+            (user_id, since, until),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+    finally:
+        conn.close()
+
+
+def get_expenses_by_category(user_id: int, since):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT category, SUM(amount) FROM expenses "
+            "WHERE user_id = %s AND created_at >= %s "
+            "GROUP BY category ORDER BY SUM(amount) DESC",
+            (user_id, since),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+    finally:
+        conn.close()
     since = datetime.combine(date.today().replace(day=1), datetime.min.time())
     conn = get_conn()
     try:
@@ -329,8 +365,9 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["➕ Добавить расход"],
         ["📊 За сегодня", "📅 За месяц"],
-        ["🎯 Лимиты", "⚙️ Категории"],
-        ["❌ Удалить последнюю", "ℹ️ Помощь"],
+        ["📈 Графики", "🎯 Лимиты"],
+        ["⚙️ Категории", "❌ Удалить последнюю"],
+        ["ℹ️ Помощь"],
     ],
     resize_keyboard=True,
 )
@@ -397,6 +434,150 @@ async def check_and_warn_limit(user_id: int, category: str, send_func):
         )
 
 
+COLORS = [
+    "#FF6B6B", "#4ECDC4", "#45B7D1", "#96CEB4", "#FFEAA7",
+    "#DDA0DD", "#98D8C8", "#F7DC6F", "#BB8FCE", "#85C1E9",
+]
+
+
+def make_pie_chart(rows, title):
+    labels = [r[0] for r in rows]
+    values = [float(r[1]) for r in rows]
+    total = sum(values)
+
+    fig, ax = plt.subplots(figsize=(7, 5), facecolor="#1e1e2e")
+    ax.set_facecolor("#1e1e2e")
+
+    wedges, texts, autotexts = ax.pie(
+        values,
+        labels=None,
+        autopct=lambda p: f"{p:.1f}%" if p > 3 else "",
+        colors=COLORS[:len(values)],
+        startangle=140,
+        wedgeprops={"edgecolor": "#1e1e2e", "linewidth": 1.5},
+        pctdistance=0.75,
+    )
+    for at in autotexts:
+        at.set_color("white")
+        at.set_fontsize(9)
+
+    legend_labels = [f"{l}  —  {v:.0f}" for l, v in zip(labels, values)]
+    patches = [mpatches.Patch(color=COLORS[i % len(COLORS)], label=legend_labels[i])
+               for i in range(len(labels))]
+    ax.legend(handles=patches, loc="center left", bbox_to_anchor=(1, 0.5),
+              fontsize=9, facecolor="#2e2e3e", labelcolor="white", edgecolor="#555")
+
+    ax.set_title(f"{title}\nВсего: {total:.0f}", color="white", fontsize=12, pad=15)
+
+    buf = io.BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format="png", dpi=130, bbox_inches="tight", facecolor="#1e1e2e")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def make_bar_chart(rows, title):
+    if not rows:
+        return None
+
+    days = [str(r[0]) for r in rows]
+    values = [float(r[1]) for r in rows]
+
+    # Короткие метки: день.месяц
+    short_labels = []
+    for d in days:
+        parts = d.split("-")
+        short_labels.append(f"{parts[2]}.{parts[1]}")
+
+    fig, ax = plt.subplots(figsize=(max(7, len(days) * 0.5 + 2), 4.5), facecolor="#1e1e2e")
+    ax.set_facecolor("#2e2e3e")
+
+    bars = ax.bar(range(len(values)), values, color="#4ECDC4", edgecolor="#1e1e2e", linewidth=0.8)
+
+    for bar, val in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(values) * 0.01,
+                f"{val:.0f}", ha="center", va="bottom", color="white", fontsize=8)
+
+    ax.set_xticks(range(len(short_labels)))
+    ax.set_xticklabels(short_labels, rotation=45, ha="right", color="white", fontsize=8)
+    ax.tick_params(axis="y", colors="white")
+    ax.spines[:].set_color("#555")
+    ax.set_title(title, color="white", fontsize=12, pad=10)
+    ax.set_ylabel("Сумма", color="white", fontsize=9)
+    ax.yaxis.label.set_color("white")
+
+    buf = io.BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format="png", dpi=130, bbox_inches="tight", facecolor="#1e1e2e")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def charts_menu_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🥧 Расходы по категориям (месяц)", callback_data="chart:pie_month")],
+            [InlineKeyboardButton("📊 Траты по дням (месяц)", callback_data="chart:bar_month")],
+            [InlineKeyboardButton("📊 Траты по дням (7 дней)", callback_data="chart:bar_week")],
+            [InlineKeyboardButton("🚫 Закрыть", callback_data="chart:close")],
+        ]
+    )
+
+
+async def charts_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Выбери тип графика:",
+        reply_markup=charts_menu_keyboard(),
+    )
+
+
+async def chart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+
+    if action == "close":
+        await query.edit_message_text("Закрыто.")
+        return
+
+    await query.edit_message_text("⏳ Строю график, подожди секунду...")
+
+    if action == "pie_month":
+        since = datetime.combine(date.today().replace(day=1), datetime.min.time())
+        rows = get_expenses_by_category(user_id, since)
+        if not rows:
+            await context.bot.send_message(chat_id=chat_id, text="За этот месяц расходов пока нет.")
+            return
+        month_name = date.today().strftime("%B %Y")
+        buf = make_pie_chart(rows, f"Расходы по категориям\n{month_name}")
+        await context.bot.send_photo(chat_id=chat_id, photo=buf)
+
+    elif action == "bar_month":
+        since = datetime.combine(date.today().replace(day=1), datetime.min.time())
+        until = datetime.now()
+        rows = get_expenses_by_day(user_id, since, until)
+        if not rows:
+            await context.bot.send_message(chat_id=chat_id, text="За этот месяц расходов пока нет.")
+            return
+        month_name = date.today().strftime("%B %Y")
+        buf = make_bar_chart(rows, f"Траты по дням — {month_name}")
+        await context.bot.send_photo(chat_id=chat_id, photo=buf)
+
+    elif action == "bar_week":
+        since = datetime.combine(date.today() - timedelta(days=6), datetime.min.time())
+        until = datetime.now()
+        rows = get_expenses_by_day(user_id, since, until)
+        if not rows:
+            await context.bot.send_message(chat_id=chat_id, text="За последние 7 дней расходов пока нет.")
+            return
+        buf = make_bar_chart(rows, "Траты за последние 7 дней")
+        await context.bot.send_photo(chat_id=chat_id, photo=buf)
+
+
 # ---------- Базовые команды ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -404,6 +585,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я помогу вести учёт расходов.\n\n"
         "➕ Добавить расход — записать трату по шагам\n"
+        "📈 Графики — круговая диаграмма и график по дням\n"
         "🎯 Лимиты — установить лимит по категории и следить за ним\n"
         "⚙️ Категории — добавить, переименовать или удалить категории\n"
         "📊 За сегодня / 📅 За месяц — посмотреть статистику\n"
@@ -742,6 +924,8 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await undo(update, context)
     elif text == "ℹ️ Помощь":
         await help_cmd(update, context)
+    elif text == "📈 Графики":
+        await charts_open(update, context)
     elif text == "🎯 Лимиты":
         await limits_open(update, context)
     elif text == "⚙️ Категории":
@@ -811,11 +995,13 @@ def main():
     app.add_handler(add_conversation)
     app.add_handler(limit_conversation)
     app.add_handler(category_manage_conversation)
+    app.add_handler(CallbackQueryHandler(chart_callback, pattern=r"^chart:"))
     app.add_handler(CommandHandler("today", today))
     app.add_handler(CommandHandler("month", month))
     app.add_handler(CommandHandler("undo", undo))
     app.add_handler(CommandHandler("limits", limits_open))
     app.add_handler(CommandHandler("categories", categories_open))
+    app.add_handler(CommandHandler("charts", charts_open))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
 
     print("Бот запущен...")
