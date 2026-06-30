@@ -534,6 +534,12 @@ CATMGR_WAITING_NEW_NAME, CATMGR_WAITING_RENAME = range(5, 7)
 INCOME_WAITING_AMOUNT, INCOME_WAITING_SOURCE = range(7, 9)
 REC_WAITING_NAME, REC_WAITING_AMOUNT, REC_WAITING_CATEGORY, REC_WAITING_DAY = range(9, 13)
 
+MENU_BUTTONS_PATTERN = (
+    "^(➕ Добавить расход|💵 Добавить доход|📊 За сегодня|📅 За месяц|"
+    "💰 Баланс|📈 Графики|🎯 Лимиты|⚙️ Категории|"
+    "🔄 Регулярные платежи|❌ Удалить последнюю|ℹ️ Помощь)$"
+)
+
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["➕ Добавить расход", "💵 Добавить доход"],
@@ -1023,7 +1029,19 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data.pop("pending_limit_category", None)
     context.user_data.pop("pending_rename_category", None)
     context.user_data.pop("pending_income", None)
+    context.user_data.pop("rec_name", None)
+    context.user_data.pop("rec_amount", None)
+    context.user_data.pop("rec_category", None)
     await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
+    return ConversationHandler.END
+
+
+async def menu_button_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Перехватывает нажатия кнопок главного меню внутри любого диалога."""
+    context.user_data.clear()
+    await cancel_conversation(update, context)
+    # После сброса — выполняем нужное действие
+    await handle_buttons(update, context)
     return ConversationHandler.END
 
 
@@ -1455,7 +1473,10 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, custom_category_received)
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+        fallbacks=[
+            CommandHandler("cancel", cancel_conversation),
+            MessageHandler(filters.Regex(MENU_BUTTONS_PATTERN), menu_button_fallback),
+        ],
     )
 
     limit_conversation = ConversationHandler(
@@ -1470,7 +1491,10 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, limit_amount_received)
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+        fallbacks=[
+            CommandHandler("cancel", cancel_conversation),
+            MessageHandler(filters.Regex(MENU_BUTTONS_PATTERN), menu_button_fallback),
+        ],
         per_message=False,
     )
 
@@ -1489,7 +1513,10 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, category_rename_received)
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+        fallbacks=[
+            CommandHandler("cancel", cancel_conversation),
+            MessageHandler(filters.Regex(MENU_BUTTONS_PATTERN), menu_button_fallback),
+        ],
         per_message=False,
     )
 
@@ -1507,7 +1534,10 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, income_custom_source_received),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+        fallbacks=[
+            CommandHandler("cancel", cancel_conversation),
+            MessageHandler(filters.Regex(MENU_BUTTONS_PATTERN), menu_button_fallback),
+        ],
     )
 
     recurring_conversation = ConversationHandler(
@@ -1528,7 +1558,10 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, rec_day_received)
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+        fallbacks=[
+            CommandHandler("cancel", cancel_conversation),
+            MessageHandler(filters.Regex(MENU_BUTTONS_PATTERN), menu_button_fallback),
+        ],
         per_message=False,
     )
 
