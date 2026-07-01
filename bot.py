@@ -1,5 +1,6 @@
 import io
 import os
+import re
 from datetime import datetime, date, timedelta
 from urllib.parse import urlparse
 
@@ -8,6 +9,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import httpx
 
 from telegram import (
     Update,
@@ -30,6 +32,7 @@ from telegram.ext import (
 # ──────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВАШ_ТОКЕН_ЗДЕСЬ")
 DATABASE_URL = os.environ.get("DATABASE_URL")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL не задан. Добавь переменную в Railway Variables.")
@@ -434,7 +437,8 @@ def mark_recurring_added(rec_id, added_date):
     LIM_CATEGORY, LIM_AMOUNT,
     CAT_NEW_NAME, CAT_RENAME,
     REC_NAME, REC_AMOUNT, REC_CATEGORY, REC_DAY,
-) = range(14)
+    VOICE_CONFIRM,
+) = range(15)
 
 # ──────────────────────────────────────────────
 # КЛАВИАТУРЫ
@@ -1171,6 +1175,195 @@ async def job_check_recurring(context):
 
 
 # ──────────────────────────────────────────────
+# ГОЛОСОВОЙ ВВОД
+# ──────────────────────────────────────────────
+
+async def transcribe_voice(file_bytes: bytes) -> str:
+    """Отправляет аудио в Groq Whisper API и возвращает текст."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            files={"file": ("voice.ogg", file_bytes, "audio/ogg")},
+            data={"model": "whisper-large-v3", "language": "ru"},
+        )
+        response.raise_for_status()
+        return response.json().get("text", "").strip()
+
+
+def parse_expense_from_text(text: str, categories: list):
+    """
+    Пытается извлечь сумму и категорию из распознанного текста.
+    Примеры: "потратил 350 на кафе", "500 рублей еда", "купил кофе за 200".
+    Возвращает (amount, category) или (None, None).
+    """
+    text_lower = text.lower()
+
+    # Ищем число (сумму)
+    amounts = re.findall(r"\b(\d+(?:[.,]\d+)?)\b", text)
+    if not amounts:
+        return None, None
+    amount = float(amounts[0].replace(",", "."))
+
+    # Пробуем найти совпадение с известной категорией (без эмодзи)
+    matched_cat = None
+    for cat in categories:
+        cat_name = re.sub(r"[^\w\s]", "", cat).strip().lower()
+        if cat_name and cat_name in text_lower:
+            matched_cat = cat
+            break
+
+    # Если категорию не нашли — пробуем вытащить слово после "на", "в", "за"
+    if not matched_cat:
+        for pretext in [r"на\s+(\w+)", r"в\s+(\w+)", r"за\s+\w+\s+(\w+)", r"на\s+(\w+\s+\w+)"]:
+            m = re.search(pretext, text_lower)
+            if m:
+                matched_cat = m.group(1).capitalize()
+                break
+
+    return amount, matched_cat
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает голосовое сообщение."""
+    if not OPENAI_API_KEY:
+        await update.message.reply_text(
+            "Голосовой ввод не настроен. Добавь переменную OPENAI_API_KEY в Railway Variables."
+        )
+        return ConversationHandler.END
+
+    msg = await update.message.reply_text("🎙 Распознаю речь...")
+
+    try:
+        # Скачиваем голосовое сообщение
+        voice = update.message.voice
+        tg_file = await context.bot.get_file(voice.file_id)
+        file_bytes = await tg_file.download_as_bytearray()
+
+        # Распознаём текст
+        text = await transcribe_voice(bytes(file_bytes))
+        if not text:
+            await msg.edit_text("Не удалось распознать речь. Попробуй ещё раз.")
+            return ConversationHandler.END
+
+        await msg.edit_text(f"🎙 Распознано: «{text}»\n\nПарсю сумму и категорию...")
+
+        # Парсим сумму и категорию
+        user_id = update.effective_user.id
+        cats = get_user_categories(user_id)
+        amount, category = parse_expense_from_text(text, cats)
+
+        if amount is None:
+            await msg.edit_text(
+                f"🎙 Распознано: «{text}»\n\n"
+                "Не нашёл сумму в тексте. Попробуй сказать чётче, например:\n"
+                "«Потратил 350 рублей на кафе»"
+            )
+            return ConversationHandler.END
+
+        # Сохраняем для подтверждения
+        context.user_data["voice_amount"] = amount
+        context.user_data["voice_category"] = category or "🛒 Прочее"
+        context.user_data["voice_text"] = text
+
+        cat_display = category if category else "🛒 Прочее (не распознана)"
+
+        await msg.edit_text(
+            f"🎙 Распознано: «{text}»\n\n"
+            f"Добавить расход?\n"
+            f"• Сумма: {amount:.2f}\n"
+            f"• Категория: {cat_display}",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Да", callback_data="voice:confirm"),
+                    InlineKeyboardButton("✏️ Изменить категорию", callback_data="voice:change_cat"),
+                ],
+                [InlineKeyboardButton("❌ Отмена", callback_data="voice:cancel")],
+            ]),
+        )
+        return VOICE_CONFIRM
+
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 401:
+            await msg.edit_text("Ошибка: неверный OPENAI_API_KEY. Проверь переменную в Railway.")
+        else:
+            await msg.edit_text(f"Ошибка API: {e.response.status_code}. Попробуй позже.")
+        return ConversationHandler.END
+    except Exception as e:
+        await msg.edit_text(f"Произошла ошибка: {e}")
+        return ConversationHandler.END
+
+
+async def voice_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+
+    if action == "cancel":
+        context.user_data.pop("voice_amount", None)
+        context.user_data.pop("voice_category", None)
+        await query.edit_message_text("Отменено.")
+        return ConversationHandler.END
+
+    if action == "change_cat":
+        user_id = query.from_user.id
+        cats = get_user_categories(user_id)
+        await query.edit_message_text(
+            "Выбери категорию:",
+            reply_markup=make_kb(cats, "voicecat"),
+        )
+        return VOICE_CONFIRM
+
+    if action == "confirm":
+        amount = context.user_data.pop("voice_amount", None)
+        category = context.user_data.pop("voice_category", None)
+        context.user_data.pop("voice_text", None)
+
+        if amount is None:
+            await query.edit_message_text("Что-то пошло не так. Начни заново.")
+            return ConversationHandler.END
+
+        user_id = query.from_user.id
+        add_expense(user_id, amount, category)
+        await query.edit_message_text(f"✅ Добавлено: {amount:.2f} — {category}")
+        await warn_limit(
+            user_id, category,
+            lambda t: context.bot.send_message(chat_id=query.message.chat_id, text=t),
+        )
+        return ConversationHandler.END
+
+    return ConversationHandler.END
+
+
+async def voice_change_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает выбор новой категории после голосового ввода."""
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+
+    if choice == "__cancel__":
+        context.user_data.pop("voice_amount", None)
+        context.user_data.pop("voice_category", None)
+        await query.edit_message_text("Отменено.")
+        return ConversationHandler.END
+
+    context.user_data["voice_category"] = choice
+    amount = context.user_data.get("voice_amount", 0)
+
+    await query.edit_message_text(
+        f"Добавить расход?\n• Сумма: {amount:.2f}\n• Категория: {choice}",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Да", callback_data="voice:confirm"),
+                InlineKeyboardButton("✏️ Изменить категорию", callback_data="voice:change_cat"),
+            ],
+            [InlineKeyboardButton("❌ Отмена", callback_data="voice:cancel")],
+        ]),
+    )
+    return VOICE_CONFIRM
+
+
+# ──────────────────────────────────────────────
 # ОБЩИЙ ОБРАБОТЧИК КНОПОК МЕНЮ
 # ──────────────────────────────────────────────
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1293,6 +1486,21 @@ def main():
         allow_reentry=True,
     )
 
+    # Диалог: голосовой ввод
+    voice_conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.VOICE, handle_voice),
+        ],
+        states={
+            VOICE_CONFIRM: [
+                CallbackQueryHandler(voice_change_cat, pattern=r"^voicecat:"),
+                CallbackQueryHandler(voice_confirm, pattern=r"^voice:"),
+            ],
+        },
+        fallbacks=make_fallbacks(),
+        allow_reentry=True,
+    )
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("today", cmd_today))
@@ -1310,6 +1518,7 @@ def main():
     app.add_handler(lim_conv)
     app.add_handler(cat_conv)
     app.add_handler(rec_conv)
+    app.add_handler(voice_conv)
 
     app.add_handler(CallbackQueryHandler(cb_chart, pattern=r"^chart:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
